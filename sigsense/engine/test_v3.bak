@@ -1,0 +1,346 @@
+#include <iostream>
+#include <cstdio>
+#include <string>
+#include <chrono>
+#include <thread>
+#include <array>
+#include <memory>
+#include <fstream> 
+#include <ctime>
+#include <csignal>
+
+// Platform-Specific Core Network and Performance Headers
+#ifdef __APPLE__
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <unistd.h>
+    #include <fcntl.h>
+#elif defined(_WIN32)
+    #include <windows.h>
+    #include <pdh.h>
+    #include <pdhmsg.h>
+    #include <iphlpapi.h>
+    #include <icmpapi.h>
+    #pragma comment(lib, "pdh.lib")
+    #pragma comment(lib, "iphlpapi.lib")
+    #pragma comment(lib, "ws2_32.lib")
+#endif
+
+// Global pointer for clean exit Signal Handling
+class EcoPrintTracker* globalTrackerPtr = nullptr;
+
+class EcoPrintTracker {
+private:
+    double gridIntensity;
+    double waterFactor;
+    std::ofstream logFile;
+    
+    // Client Operational Ledger
+    double totalClientEnergy = 0.0;
+    double totalClientCarbon = 0.0;
+    double totalClientWater = 0.0;
+
+    // EcoPrint Tracking Overhead Ledger
+    double totalOverheadEnergy = 0.0;
+    double totalOverheadCarbon = 0.0;
+
+    // Network Performance Analytics
+    double totalLatency = 0.0;
+    double maxLatency = 0.0;
+    long long latencySamples = 0;
+
+public:
+    EcoPrintTracker(double carbon, double water) 
+        : gridIntensity(carbon), waterFactor(water) {
+        
+        logFile.open("telemetry_log.csv", std::ios::app);
+        
+        std::time_t now = std::time(0);
+        char dt[26];
+        #ifdef _WIN32
+            ctime_s(dt, sizeof(dt), &now);
+        #else
+            ctime_r(&now, dt);
+        #endif
+        std::string timeStr(dt);
+        timeStr.erase(timeStr.length() - 1);
+
+        std::string systemTag = "";
+        #ifdef __APPLE__
+            systemTag = " [OS: MACOS | TARGET: APPLE_SILICON]";
+        #elif defined(_WIN32)
+            systemTag = " [OS: WINDOWS | TARGET: INTEL_x86]";
+        #else
+            systemTag = " [OS: UNKNOWN]";
+        #endif
+
+        if (logFile.is_open()) {
+            logFile << "\n--- NEW SESSION START: " << timeStr << systemTag << " ---\n";
+            // Comprehensive 10-Column Compliance Data Schema
+            logFile << "Timestamp,Total_W,Client_W,Overhead_W,Client_kWh,Overhead_kWh,Client_gCO2e,Overhead_gCO2e,Water_Liters,Network_Latency_ms\n";
+            logFile.flush();
+        }
+        
+        std::cout << "Master Log Session Engaged: " << timeStr << systemTag << std::endl;
+    }
+
+    void calculateImpact(double total_W, double executionTimeMs, double latency_ms) {
+        // Compute the proportion of the 1-second interval consumed by the tracker execution loop
+        double overheadFactor = executionTimeMs / 1000.0;
+        if (overheadFactor > 1.0) overheadFactor = 1.0;
+        if (overheadFactor < 0.001) overheadFactor = 0.001; // Minimum floor for active loop metrics
+
+        // Itemize power channels
+        double overhead_W = total_W * overheadFactor;
+        double client_W = total_W - overhead_W;
+        if (client_W < 0.0) client_W = 0.0;
+
+        // Calculate discrete frame energy allocations (using 1-second nominal slice)
+        double clientKwh = (client_W * (1.0 / 3600.0)) / 1000.0;
+        double overheadKwh = (overhead_W * (1.0 / 3600.0)) / 1000.0;
+
+        // Calculate environmental impacts
+        double clientCarbon = clientKwh * gridIntensity;
+        double overheadCarbon = overheadKwh * gridIntensity;
+        double clientWater = clientKwh * waterFactor;
+
+        // Accumulate running historical ledgers
+        totalClientEnergy += clientKwh;
+        totalClientCarbon += clientCarbon;
+        totalClientWater += clientWater;
+
+        totalOverheadEnergy += overheadKwh;
+        totalOverheadCarbon += overheadCarbon;
+
+        // Process network statistics
+        if (latency_ms >= 0.0) {
+            totalLatency += latency_ms;
+            latencySamples++;
+            if (latency_ms > maxLatency) {
+                maxLatency = latency_ms;
+            }
+        }
+
+        std::time_t now = std::time(0);
+        char dt[26];
+        #ifdef _WIN32
+            ctime_s(dt, sizeof(dt), &now);
+        #else
+            ctime_r(&now, dt);
+        #endif
+        std::string timeStr(dt);
+        timeStr.erase(timeStr.length() - 1);
+
+        // Print itemized diagnostic matrix to terminal
+        std::printf("--- Telemetry: %s | Total Power: %.3f W ---\n", timeStr.c_str(), total_W);
+        std::printf("    ├── Client Workload: %.3f W | Carbon: %.6f gCO2e\n", client_W, clientCarbon);
+        std::printf("    └── EcoPrint Engine: %.3f W | Carbon: %.6f gCO2e | Latency: %.0f ms\n", overhead_W, overheadCarbon, latency_ms);
+
+        // Commit full 10-column database stream row to disk
+        if (logFile.is_open()) {
+            logFile << timeStr << "," << total_W << "," << client_W << "," << overhead_W << "," 
+                    << clientKwh << "," << overheadKwh << "," << clientCarbon << "," << overheadCarbon << "," 
+                    << clientWater << "," << latency_ms << "\n";
+            logFile.flush(); 
+        }
+    }
+
+    void printSummary(std::string type = "INTERVAL") {
+        std::printf("\n=====================================================\n");
+        std::printf("        ECOPRINT AI: %s COMPLIANCE AUDIT\n", type.c_str());
+        std::printf("=====================================================\n");
+        std::printf("1. CLIENT WORKLOAD EMISSIONS:\n");
+        std::printf("   -> Total Energy: %.8f kWh\n", totalClientEnergy);
+        std::printf("   -> Total Carbon: %.8f gCO2e\n", totalClientCarbon);
+        std::printf("   -> Total Water:  %.8f Liters\n", totalClientWater);
+        std::printf("2. ECOPRINT OBSERVER OVERHEAD:\n");
+        std::printf("   -> Total Energy: %.8f kWh\n", totalOverheadEnergy);
+        std::printf("   -> Total Carbon: %.8f gCO2e\n", totalOverheadCarbon);
+        std::printf("-----------------------------------------------------\n");
+        if (latencySamples > 0) {
+            std::printf("Network Link Quality: Avg %u ms | Peak %u ms\n", 
+                        (unsigned int)(totalLatency / latencySamples), (unsigned int)maxLatency);
+        } else {
+            std::printf("Network Link Quality: OFFLINE\n");
+        }
+        std::printf("=====================================================\n\n");
+    }
+
+    ~EcoPrintTracker() {
+        if (logFile.is_open()) {
+            logFile << "--- SESSION END ---\n";
+            logFile.close();
+        }
+    }
+};
+
+void signalHandler(int signum) {
+    if (globalTrackerPtr != nullptr) {
+        globalTrackerPtr->printSummary("FINAL AUDIT");
+    }
+    exit(signum);
+}
+
+// =========================================================================
+// CROSS-PLATFORM NATIVE LATENCY UTILITIES
+// =========================================================================
+double getNetworkLatency() {
+#ifdef __APPLE__
+    auto start = std::chrono::high_resolution_clock::now();
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1.0;
+
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 500000; 
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    struct sockaddr_in serv_addr;
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(53); 
+    inet_pton(AF_INET, "1.1.1.1", &serv_addr.sin_addr);
+
+    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+        close(sock);
+        return -1.0; 
+    }
+    close(sock);
+    auto end = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+#elif defined(_WIN32)
+    HANDLE icmpHandle = IcmpCreateFile();
+    if (icmpHandle == INVALID_HANDLE_VALUE) return -1.0;
+
+    char sendData[32] = "EcoPrintProbe";
+    DWORD replySize = sizeof(ICMP_ECHO_REPLY) + sizeof(sendData);
+    std::unique_ptr<char[]> replyBuffer(new char[replySize]);
+
+    DWORD numReplies = IcmpSendEcho(
+        icmpHandle, inet_addr("1.1.1.1"), 
+        sendData, sizeof(sendData), 
+        NULL, replyBuffer.get(), replySize, 500
+    );
+
+    if (numReplies == 0) {
+        IcmpCloseHandle(icmpHandle);
+        return -1.0;
+    }
+
+    PICMP_ECHO_REPLY echoReply = (PICMP_ECHO_REPLY)replyBuffer.get();
+    double rtt = (double)echoReply->RoundTripTime;
+    IcmpCloseHandle(icmpHandle);
+    return rtt;
+#else
+    return 0.0;
+#endif
+}
+
+// =========================================================================
+// CONTINUOUS TELEMETRY PROCESSING CONTINUUM
+// =========================================================================
+void runContinuousTelemetry(EcoPrintTracker& liveSession) {
+#ifdef __APPLE__
+    const char* cmd = "/usr/bin/powermetrics -i 1000 --samplers cpu_power,gpu_power,ane_power 2>&1";
+    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
+    if (!pipe) throw std::runtime_error("Failed to map system powermetrics pipeline.");
+
+    std::array<char, 256> buffer;
+    double cpu_mW = 0, gpu_mW = 0, ane_mW = 0, combined_mW = 0;
+    int counter = 0;
+
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+        // Start high-resolution snapshot clock to measure internal code processing overhead time
+        auto internal_start = std::chrono::high_resolution_clock::now();
+        
+        std::string line = buffer.data();
+        try {
+            if (line.find("CPU Power:") != std::string::npos) {
+                cpu_mW = std::stod(line.substr(line.find(":") + 1));
+            }
+            else if (line.find("GPU Power:") != std::string::npos) {
+                gpu_mW = std::stod(line.substr(line.find(":") + 1));
+            }
+            else if (line.find("ANE Power:") != std::string::npos) {
+                ane_mW = std::stod(line.substr(line.find(":") + 1));
+            }
+            else if (line.find("Combined Power") != std::string::npos) {
+                combined_mW = std::stod(line.substr(line.find(":") + 1));
+                double total_W = combined_mW / 1000.0;
+                
+                double latency = getNetworkLatency();
+
+                // Terminate clock check to isolate our execution timeline segment
+                auto internal_end = std::chrono::high_resolution_clock::now();
+                double executionTimeMs = std::chrono::duration_cast<std::chrono::microseconds>(internal_end - internal_start).count() / 1000.0;
+
+                // Pass total power, processing duration, and latency into the separation processor
+                liveSession.calculateImpact(total_W, executionTimeMs, latency);
+                
+                if (++counter % 10 == 0) liveSession.printSummary("INTERVAL");
+            }
+        } catch (...) {}
+    }
+
+#elif defined(_WIN32)
+    int counter = 0;
+    std::cout << "[SYSTEM] Initializing Native Windows PDH Telemetry Context..." << std::endl;
+    
+    PDH_HQUERY cpuQuery;
+    PDH_HCOUNTER cpuCounter;
+
+    if (PdhOpenQuery(NULL, NULL, &cpuQuery) != ERROR_SUCCESS) return;
+    PdhAddEnglishCounter(cpuQuery, "\\Processor Information(_Total)\\% Processor Performance", NULL, &cpuCounter);
+    PdhCollectQueryData(cpuQuery);
+
+    while (true) {
+        auto loop_start = std::chrono::high_resolution_clock::now();
+
+        PdhCollectQueryData(cpuQuery);
+        PDH_FMT_COUNTERVALUE counterValue;
+        PdhGetFormattedCounterValue(cpuCounter, PDH_FMT_DOUBLE, NULL, &counterValue);
+
+        double current_scaling = counterValue.doubleValue; 
+        if (current_scaling < 1.0) current_scaling = 15.0; 
+
+        double cpu_mW = current_scaling * 250.0;   
+        double gpu_mW = current_scaling * 65.0;    
+        double combined_W = (cpu_mW + gpu_mW) / 1000.0;
+
+        double latency = getNetworkLatency();
+
+        auto loop_end = std::chrono::high_resolution_clock::now();
+        double executionTimeMs = std::chrono::duration_cast<std::chrono::microseconds>(loop_end - loop_start).count() / 1000.0;
+
+        // Process itemized metrics using the precise loop execution length
+        liveSession.calculateImpact(combined_W, executionTimeMs, latency);
+
+        if (++counter % 10 == 0) liveSession.printSummary("INTERVAL");
+
+        long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(loop_end - loop_start).count();
+        long long target_sleep = 1000 - elapsed_ms;
+        
+        if (target_sleep > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(target_sleep));
+        }
+    }
+    PdhCloseQuery(cpuQuery);
+#endif
+}
+
+int main() {
+    EcoPrintTracker liveSession(475.0, 1.92);
+    globalTrackerPtr = &liveSession;
+    std::signal(SIGINT, signalHandler);
+
+    std::cout << "EcoPrint AI V3.13: Multi-Ledger Compliance Engine Active" << std::endl;
+    std::cout << "Recording bifurcated metrics to telemetry_log.csv. Press Ctrl+C to stop.\n" << std::endl;
+
+    try {
+        runContinuousTelemetry(liveSession);
+    } catch (const std::exception& e) {
+        std::cerr << "Engine Crash: " << e.what() << std::endl;
+    }
+    return 0;
+}

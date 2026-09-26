@@ -1,0 +1,5 @@
+
+# Local telemetry databases
+*.db
+*.db-wal
+*.db-shm

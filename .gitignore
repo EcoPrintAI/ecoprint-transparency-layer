@@ -6,3 +6,11 @@ dist/
 build/
 coverage/
 *.log
+
+# Local SigSense runtime configuration — may contain API credentials
+sigsense/engine/ecoprint.conf
+
+# Transparency local runtime database
+src/transparency/transparency.db
+src/transparency/transparency.db-shm
+src/transparency/transparency.db-wal
