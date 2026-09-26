@@ -14,3 +14,6 @@ sigsense/engine/ecoprint.conf
 src/transparency/transparency.db
 src/transparency/transparency.db-shm
 src/transparency/transparency.db-wal
+
+sigsense/engine/telemetry_transport
+sigsense/engine/telemetry_transport.o

@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <ctime>
 #include <sstream>
+#include <algorithm>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -16,6 +17,8 @@
 static std::string getUtcTimestamp() {
     const auto now = std::chrono::system_clock::now();
     const std::time_t nowTime = std::chrono::system_clock::to_time_t(now);
+    const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()).count() % 1000;
 
     std::tm utcTime{};
 
@@ -26,17 +29,18 @@ static std::string getUtcTimestamp() {
 #endif
 
     std::ostringstream timestamp;
-    timestamp << std::put_time(&utcTime, "%Y-%m-%dT%H:%M:%SZ");
+    timestamp << std::put_time(&utcTime, "%Y-%m-%dT%H:%M:%S")
+              << '.' << std::setfill('0') << std::setw(3) << milliseconds << 'Z';
     return timestamp.str();
 }
 
-EcoPrintTracker::EcoPrintTracker(const std::string& dbPath, int sessionId, double waterFactor)
+EcoPrintTracker::EcoPrintTracker(const std::string& dbPath, int sessionId, double waterFactor, const std::string& configPath)
     : currentSessionId(sessionId),
       targetWaterFactor(waterFactor),
       nodeId("unknown-node"),
       batchFlushThreshold(10),
       isRunning(true),
-      gridService("ecoprint.conf", "ELECTRICITY_MAPS") {
+      gridService(configPath, "ELECTRICITY_MAPS") {
 
         #ifdef _WIN32
             char hostname[256];
@@ -86,6 +90,21 @@ EcoPrintTracker::EcoPrintTracker(const std::string& dbPath, int sessionId, doubl
     
     sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, start_time TEXT, init_zone TEXT);", nullptr, nullptr, &errMsg);
     sqlite3_exec(db, createTable.c_str(), nullptr, nullptr, &errMsg);
+    sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS measurement_quality (telemetry_id INTEGER PRIMARY KEY REFERENCES telemetry(id), measurement_source TEXT NOT NULL, grid_intensity_source TEXT NOT NULL DEFAULT 'unknown');", nullptr, nullptr, &errMsg);
+    sqlite3_free(errMsg);
+    errMsg = nullptr;
+    sqlite3_stmt* qualityColumns = nullptr;
+    bool hasGridQuality = false;
+    if (sqlite3_prepare_v2(db, "PRAGMA table_info(measurement_quality);", -1, &qualityColumns, nullptr) == SQLITE_OK) {
+        while (sqlite3_step(qualityColumns) == SQLITE_ROW) {
+            const unsigned char* name = sqlite3_column_text(qualityColumns, 1);
+            if (name && std::string(reinterpret_cast<const char*>(name)) == "grid_intensity_source") hasGridQuality = true;
+        }
+        sqlite3_finalize(qualityColumns);
+    }
+    if (!hasGridQuality) sqlite3_exec(db, "ALTER TABLE measurement_quality ADD COLUMN grid_intensity_source TEXT NOT NULL DEFAULT 'unknown';", nullptr, nullptr, &errMsg);
+    sqlite3_free(errMsg);
+    errMsg = nullptr;
 
     std::string timeStr = getUtcTimestamp();
 
@@ -146,7 +165,7 @@ void EcoPrintTracker::startFlushTimer() {
     });
 }
 
-void EcoPrintTracker::recordMetric(double cpu_mw, double gpu_mw, double ane_mw, double clientPower, double overheadPower, long long latency, double delta_time, const std::string& gridRegion) {
+void EcoPrintTracker::recordMetric(double cpu_mw, double gpu_mw, double ane_mw, double clientPower, double overheadPower, long long latency, double delta_time, const std::string& gridRegion, const std::string& measurementSource) {
     std::lock_guard<std::mutex> lock(trackerMutex); 
     std::string timeStr = getUtcTimestamp(); 
 
@@ -160,18 +179,19 @@ void EcoPrintTracker::recordMetric(double cpu_mw, double gpu_mw, double ane_mw, 
         gridIntensity = 376.0;
     }
 
-    double clientEnergyKwh = clientPower / 3600000.0;
-    double overheadEnergyKwh = overheadPower / 3600000.0;
+    const double intervalSeconds = std::max(0.0, delta_time);
+    double clientEnergyKwh = clientPower * intervalSeconds / 3600000.0;
+    double overheadEnergyKwh = overheadPower * intervalSeconds / 3600000.0;
 
     double clientCarbon = clientEnergyKwh * gridIntensity;
     double overheadCarbon = overheadEnergyKwh * gridIntensity;
 
     cumulativeClientEnergy += clientEnergyKwh;
-    cumulativeClientCarbon += (clientPower * gridIntensity / 3600000.0);
+    cumulativeClientCarbon += clientCarbon;
     cumulativeClientWater += (clientEnergyKwh * targetWaterFactor);
 
     cumulativeOverheadEnergy += overheadEnergyKwh;
-    cumulativeOverheadCarbon += (overheadPower * gridIntensity / 3600000.0);
+    cumulativeOverheadCarbon += overheadCarbon;
     cumulativeOverheadWater += (overheadEnergyKwh * targetWaterFactor);
 
     if (latency > maxLatency) maxLatency = latency;
@@ -180,8 +200,8 @@ void EcoPrintTracker::recordMetric(double cpu_mw, double gpu_mw, double ane_mw, 
     sampleCounter++;
 
     std::printf("--- Telemetry: %s [%s] | CPU: %.0f mW | GPU: %.0f mW | ANE: %.0f mW | Total Power: %.3f W ---\n", timeStr.c_str(), gridRegion.c_str(), cpu_mw, gpu_mw, ane_mw, totalPower);
-    std::printf("    ├── Client Workload: %.3f W | Carbon: %.6f gCO2e | Water: %.8f L\n", clientPower, (clientCarbon), (clientPower * (targetWaterFactor / 3600000.0)));
-    std::printf("    └── EcoPrint Engine: %.3f W | Carbon: %.6f gCO2e | Water: %.8f L | Latency: %lld ms | Delta: %.3f s\n", overheadPower, (overheadCarbon), (overheadPower * (targetWaterFactor / 3600000.0)), latency, delta_time);
+    std::printf("    ├── Client Workload: %.3f W | Carbon: %.6f gCO2e | Water: %.8f L\n", clientPower, clientCarbon, clientEnergyKwh * targetWaterFactor);
+    std::printf("    └── EcoPrint Engine: %.3f W | Carbon: %.6f gCO2e | Water: %.8f L | Latency: %lld ms | Delta: %.3f s | Source: %s\n", overheadPower, overheadCarbon, overheadEnergyKwh * targetWaterFactor, latency, intervalSeconds, measurementSource.c_str());
 
     memoryBuffer.push_back({
         timeStr,
@@ -191,10 +211,12 @@ void EcoPrintTracker::recordMetric(double cpu_mw, double gpu_mw, double ane_mw, 
         totalPower,
         clientPower,
         overheadPower,
-        (totalPower * gridIntensity / 3600000.0),
-        (totalPower * (targetWaterFactor / 3600000.0)),
+        totalPower * intervalSeconds * gridIntensity / 3600000.0,
+        totalPower * intervalSeconds * targetWaterFactor / 3600000.0,
         latency,
-        delta_time
+        intervalSeconds,
+        measurementSource,
+        grid.live ? "electricity-maps-live" : "fallback"
     });
 
     if (sampleCounter % 10 == 0) {
@@ -218,6 +240,8 @@ void EcoPrintTracker::flushBatchToDatabase() {
     
     // UPDATED: Insert statement now includes node_id, region, building_id, department tags
     std::string q = "INSERT INTO telemetry (session_id, node_id, region, building_id, department, timestamp, cpu_mw, gpu_mw, ane_mw, total_power_watts, client_workload_watts, ecoprint_overhead_watts, carbon_gCO2e, water_liters, latency_ms, delta_time) VALUES (?, ?, 'US-MIDW-MISO', 'HQ-Main', 'Engineering', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+    sqlite3_stmt* qualityStmt = nullptr;
+    sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO measurement_quality (telemetry_id, measurement_source, grid_intensity_source) VALUES (?, ?, ?);", -1, &qualityStmt, nullptr);
     
     if (sqlite3_prepare_v2(db, q.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
         for (const auto& row : memoryBuffer) {
@@ -236,10 +260,16 @@ void EcoPrintTracker::flushBatchToDatabase() {
             sqlite3_bind_double(stmt, 13, row.delta_time);
             
             sqlite3_step(stmt);
+            sqlite3_bind_int64(qualityStmt, 1, sqlite3_last_insert_rowid(db));
+            sqlite3_bind_text(qualityStmt, 2, row.measurementSource.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(qualityStmt, 3, row.gridIntensitySource.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(qualityStmt);
+            sqlite3_reset(qualityStmt);
             sqlite3_reset(stmt); 
         }
         sqlite3_finalize(stmt);
     }
+    if (qualityStmt) sqlite3_finalize(qualityStmt);
     sqlite3_exec(db, "COMMIT;", nullptr, nullptr, &errMsg);
     memoryBuffer.clear(); 
 }

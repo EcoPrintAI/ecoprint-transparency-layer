@@ -98,6 +98,11 @@ export {
 // CLI lifecycle orchestrator
 export { runUnderTransparency, DEFAULT_TRANSPARENCY_DB } from './cli.js';
 
+// Derived metric and reasoning interfaces
+export { prepareTelemetryRows, summarizeTelemetry } from './metrics.js';
+export { deriveInsights } from './insights.js';
+export { explainWithProvider } from './ai.js';
+
 // Identity propagation
 export {
     ENV_WORKLOAD_ID,

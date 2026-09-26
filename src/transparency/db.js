@@ -133,6 +133,7 @@ export async function initSchema(db) {
             attributed_power_watts   REAL    NOT NULL DEFAULT 0.0,
             attributed_carbon_gco2e  REAL    NOT NULL DEFAULT 0.0,
             attributed_water_liters  REAL    NOT NULL DEFAULT 0.0,
+            duration_seconds        REAL    NOT NULL DEFAULT 0.0,
             attribution_method   TEXT    NOT NULL,
             evidence_level       TEXT    NOT NULL
                                  CHECK (evidence_level IN ('exact', 'shared', 'unattributed')),
@@ -145,6 +146,20 @@ export async function initSchema(db) {
         CREATE INDEX IF NOT EXISTS idx_attr_ts           ON attribution_records(telemetry_timestamp);
         CREATE INDEX IF NOT EXISTS idx_attr_resource_id  ON attribution_records(resource_id);
         CREATE INDEX IF NOT EXISTS idx_attr_version      ON attribution_records(attribution_version);
+
+        CREATE TABLE IF NOT EXISTS run_metrics (
+            run_id                  TEXT PRIMARY KEY REFERENCES runs(run_id),
+            duration_ms             REAL NOT NULL,
+            average_power_watts     REAL NOT NULL,
+            peak_power_watts        REAL,
+            energy_wh               REAL NOT NULL,
+            carbon_gco2e            REAL NOT NULL,
+            water_liters            REAL NOT NULL,
+            attribution_coverage    REAL NOT NULL,
+            measurement_quality     TEXT NOT NULL,
+            grid_intensity_quality  TEXT NOT NULL DEFAULT 'unknown',
+            created_at              TEXT NOT NULL
+        );
     `;
 
     await new Promise((resolve, reject) => {
@@ -160,6 +175,8 @@ export async function initSchema(db) {
     await _addColumnIfMissing(db, 'workloads', 'identity_source', "TEXT NOT NULL DEFAULT 'local'");
     await _addColumnIfMissing(db, 'runs',      'identity_source', "TEXT NOT NULL DEFAULT 'local'");
     await _addColumnIfMissing(db, 'attempts',  'identity_source', "TEXT NOT NULL DEFAULT 'local'");
+    await _addColumnIfMissing(db, 'attribution_records', 'duration_seconds', 'REAL NOT NULL DEFAULT 0.0');
+    await _addColumnIfMissing(db, 'run_metrics', 'grid_intensity_quality', "TEXT NOT NULL DEFAULT 'unknown'");
 }
 
 /**

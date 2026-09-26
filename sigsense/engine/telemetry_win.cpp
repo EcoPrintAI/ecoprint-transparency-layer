@@ -55,9 +55,12 @@ void runContinuousTelemetry(EcoPrintTracker& liveSession) {
     PdhAddEnglishCounter(cpuQuery, "\\Processor Information(_Total)\\% Processor Performance", NULL, &cpuCounter);
     PdhCollectQueryData(cpuQuery);
 
+    std::chrono::steady_clock::time_point lastSampleAt;
+    bool hasLastSample = false;
     while (keepRunning) {
         // Pause check: prevents sampling or SQLite writes while paused
         if (!telemetryActive) {
+            hasLastSample = false;
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;
         }
@@ -80,7 +83,9 @@ void runContinuousTelemetry(EcoPrintTracker& liveSession) {
 
         auto loop_end = std::chrono::high_resolution_clock::now();
         long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(loop_end - loop_start).count();
-        double delta_time = elapsed_ms / 1000.0;
+        auto sampleAt = std::chrono::steady_clock::now();
+        double delta_time = hasLastSample
+            ? std::chrono::duration<double>(sampleAt - lastSampleAt).count() : 0.0;
 
         // Synchronized 12-channel database commit call
         liveSession.recordMetric(
@@ -91,8 +96,11 @@ void runContinuousTelemetry(EcoPrintTracker& liveSession) {
             combined_W * 0.08,
             static_cast<long long>(latency),
             delta_time,
-            "US-MIDW-MISO"
+            "US-MIDW-MISO",
+            "estimated-pdh-proxy"
         );
+        lastSampleAt = sampleAt;
+        hasLastSample = true;
 
         long long target_sleep = 1000 - elapsed_ms;
         if (target_sleep > 0) {

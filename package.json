@@ -13,7 +13,8 @@
     "test:context": "node --test tests/context.test.js",
     "test:attribution": "node --test tests/attribution.test.js",
     "test:cli": "node --test tests/cli.test.js",
-    "ecoprint": "node bin/ecoprint.js"
+    "ecoprint": "node bin/ecoprint.js",
+    "service": "node bin/ecoprint.js service"
   },
   "dependencies": {
     "@revenuecat/purchases-js": "^1.1.0",

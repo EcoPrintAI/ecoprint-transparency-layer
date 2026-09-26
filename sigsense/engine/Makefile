@@ -29,6 +29,10 @@ else
     LDFLAGS   = -lsqlite3
 endif
 
+ifeq ($(OS),Windows_NT)
+    LDFLAGS += -ladvapi32
+endif
+
 # ── Engine binary (v3engine) ──────────────────────────────────────────────────
 ENGINE_SRCS = \
     main.cpp \

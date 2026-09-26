@@ -129,9 +129,12 @@ void runLinuxTelemetryLoop(EcoPrintTracker& liveSession) {
     std::srand(static_cast<unsigned int>(std::time(nullptr)));
  
     int iteration = 0;
+    std::chrono::steady_clock::time_point lastSampleAt;
+    bool hasLastSample = false;
     while (keepRunning) {
         // Pause check: prevents RAPL reads or SQLite insertion while paused
         if (!telemetryActive) {
+            hasLastSample = false;
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;
         }
@@ -146,7 +149,9 @@ void runLinuxTelemetryLoop(EcoPrintTracker& liveSession) {
  
         auto loop_end = std::chrono::high_resolution_clock::now();
         long long elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(loop_end - loop_start).count();
-        double delta_time = elapsed_ms / 1000.0;
+        auto sampleAt = std::chrono::steady_clock::now();
+        double delta_time = hasLastSample
+            ? std::chrono::duration<double>(sampleAt - lastSampleAt).count() : 0.0;
 
         // Synchronized 12-channel database commit call
         liveSession.recordMetric(
@@ -157,8 +162,11 @@ void runLinuxTelemetryLoop(EcoPrintTracker& liveSession) {
             ecoprintOverheadWatts,        
             simulatedLatency,             
             delta_time,                   
-            "US-MIDW-MISO"                
+            "US-MIDW-MISO",
+            usingRAPL ? "hardware-rapl" : (usingBattery ? "hardware-battery" : "fallback")
         );
+        lastSampleAt = sampleAt;
+        hasLastSample = true;
  
         iteration++;
  

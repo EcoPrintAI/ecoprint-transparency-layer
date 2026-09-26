@@ -21,15 +21,17 @@ struct TelemetrySnapshot {
     double waterConsumption;
     long long latencyMs;
     double delta_time;    // NEW: Drift Tracking
+    std::string measurementSource;
+    std::string gridIntensitySource;
 };
 
 class EcoPrintTracker {
 public:
-    EcoPrintTracker(const std::string& dbPath, int sessionId, double waterFactor);
+    EcoPrintTracker(const std::string& dbPath, int sessionId, double waterFactor, const std::string& configPath = "ecoprint.conf");
     ~EcoPrintTracker();
 
     // UPDATED: Added CPU, GPU, ANE, and Delta to the input parameters
-    void recordMetric(double cpu_mw, double gpu_mw, double ane_mw, double clientPower, double overheadPower, long long latency, double delta_time, const std::string& gridRegion);
+    void recordMetric(double cpu_mw, double gpu_mw, double ane_mw, double clientPower, double overheadPower, long long latency, double delta_time, const std::string& gridRegion, const std::string& measurementSource);
     void forceFlush();
 
 private:

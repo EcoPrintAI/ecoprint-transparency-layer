@@ -19,6 +19,7 @@
 import sqlite3 from 'sqlite3';
 import path    from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { existsSync } from 'node:fs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -26,9 +27,14 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * Default path to the SigSense telemetry database.
  * Resolved relative to this file's location so it works from any cwd.
  */
-export const DEFAULT_SIGSENSE_DB = path.resolve(
-    __dirname, '..', '..', 'sigsense', 'engine', 'ecoprint_telemetry.db'
-);
+const repoTelemetryDb = path.resolve(__dirname, '..', '..', 'sigsense', 'engine', 'ecoprint_telemetry.db');
+const installedTelemetryDb = process.platform === 'darwin'
+    ? '/Library/Application Support/EcoPrint/Data/ecoprint_telemetry.db'
+    : process.platform === 'win32'
+        ? path.join(process.env.ProgramData ?? 'C:\\ProgramData', 'EcoPrint', 'Data', 'ecoprint_telemetry.db')
+        : '/var/lib/ecoprint/ecoprint_telemetry.db';
+export const DEFAULT_SIGSENSE_DB = process.env.ECOPRINT_TELEMETRY_DB ??
+    (existsSync(installedTelemetryDb) ? installedTelemetryDb : repoTelemetryDb);
 
 /**
  * Open the SigSense database in read-only mode.
@@ -82,39 +88,57 @@ export function closeSigSenseDb(db) {
  */
 export function readTelemetryWindow(db, { windowStart, windowEnd, resourceId }) {
     return new Promise((resolve, reject) => {
-        const conditions = [
-            `timestamp IS NOT NULL`,
-            `timestamp != ''`,
-            `timestamp >= ?`,
-            `timestamp <= ?`,
-        ];
-        const params = [windowStart, windowEnd];
-
+        const conditions = ['t.timestamp IS NOT NULL', "t.timestamp != ''"];
+        const params = [];
         if (resourceId) {
-            conditions.push(`node_id = ?`);
+            conditions.push('t.node_id = ?');
             params.push(resourceId);
         }
+        const resourceSubquery = resourceId ? ' AND node_id = ?' : '';
+        conditions.push(`((t.timestamp >= ? AND t.timestamp <= ?)
+            OR t.id = (SELECT id FROM telemetry WHERE timestamp < ?${resourceSubquery} ORDER BY timestamp DESC, id DESC LIMIT 1)
+            OR t.id = (SELECT id FROM telemetry WHERE timestamp > ?${resourceSubquery} ORDER BY timestamp ASC, id ASC LIMIT 1))`);
+        params.push(windowStart, windowEnd, windowStart);
+        if (resourceId) params.push(resourceId);
+        params.push(windowEnd);
+        if (resourceId) params.push(resourceId);
 
-        const sql = `
-            SELECT timestamp,
-                   node_id            AS resource_id,
-                   total_power_watts,
-                   carbon_gCO2e,
-                   water_liters
-            FROM   telemetry
-            WHERE  ${conditions.join(' AND ')}
-            ORDER  BY timestamp ASC
-        `;
-
-        db.all(sql, params, (err, rows) => {
-            if (err) { reject(err); return; }
-            resolve(rows.map(r => ({
-                timestamp:         r.timestamp,
-                resource_id:       r.resource_id  ?? null,
-                total_power_watts: r.total_power_watts ?? 0,
-                carbon_gCO2e:      r.carbon_gCO2e      ?? 0,
-                water_liters:      r.water_liters       ?? 0,
-            })));
+        db.all('PRAGMA table_info(measurement_quality)', (schemaErr, columns) => {
+            if (schemaErr) { reject(schemaErr); return; }
+            const qualityTable = columns.length > 0;
+            const hasGridQuality = columns.some(column => column.name === 'grid_intensity_source');
+            const qualityJoin = qualityTable
+                ? 'LEFT JOIN measurement_quality q ON q.telemetry_id = t.id'
+                : '';
+            const qualityColumn = qualityTable ? 'q.measurement_source' : "'unknown'";
+            const gridQualityColumn = hasGridQuality ? 'q.grid_intensity_source' : "'unknown'";
+            const sql = `
+                SELECT t.timestamp,
+                       t.node_id AS resource_id,
+                       t.total_power_watts,
+                       t.carbon_gCO2e,
+                       t.water_liters,
+                       t.delta_time,
+                       ${qualityColumn} AS measurement_source,
+                       ${gridQualityColumn} AS grid_intensity_source
+                FROM telemetry t
+                ${qualityJoin}
+                WHERE ${conditions.join(' AND ')}
+                ORDER BY t.timestamp ASC
+            `;
+            db.all(sql, params, (err, rows) => {
+                if (err) { reject(err); return; }
+                resolve(rows.map(r => ({
+                    timestamp:         r.timestamp,
+                    resource_id:       r.resource_id ?? null,
+                    total_power_watts: r.total_power_watts ?? 0,
+                    carbon_gCO2e:      r.carbon_gCO2e ?? 0,
+                    water_liters:      r.water_liters ?? 0,
+                    interval_seconds:  r.delta_time ?? 0,
+                    measurement_source: r.measurement_source ?? 'unknown',
+                    grid_intensity_source: r.grid_intensity_source ?? 'unknown',
+                })));
+            });
         });
     });
 }

@@ -138,6 +138,7 @@ function printReport(result) {
     console.log(`  Started    : ${result.startedAt}`);
     console.log(`  Ended      : ${result.endedAt}`);
     console.log(`  Duration   : ${fmtDuration(result.durationMs)}`);
+    if (result.ipcError) console.log(`  Service IPC : unavailable (${result.ipcError})`);
     console.log('');
 
     // ── Telemetry & Attribution ───────────────────────────────────────────────
@@ -152,6 +153,22 @@ function printReport(result) {
         console.log(`     (Engine may not have been running during this window.)`);
     } else {
         console.log(`  Telemetry observations: ${result.telemetryCount}`);
+        const sourceCounts = result.telemetryRows.reduce((counts, row) => {
+            const source = row.measurement_source ?? 'unknown';
+            const category = source.startsWith('hardware') ? 'hardware'
+                : source === 'hardware' ? 'hardware'
+                    : source.startsWith('fallback') ? 'fallback'
+                        : source.startsWith('estimated') ? 'estimated' : 'unknown';
+            counts[category]++;
+            return counts;
+        }, { hardware: 0, fallback: 0, estimated: 0, unknown: 0 });
+        console.log(`  Measurement source: ${sourceCounts.hardware} hardware, ${sourceCounts.fallback} fallback, ${sourceCounts.estimated} estimated, ${sourceCounts.unknown} unknown`);
+        const gridCounts = result.telemetryRows.reduce((counts, row) => {
+            const source = row.grid_intensity_source ?? 'unknown';
+            counts[source === 'electricity-maps-live' ? 'live' : source === 'fallback' ? 'fallback' : 'unknown']++;
+            return counts;
+        }, { live: 0, fallback: 0, unknown: 0 });
+        console.log(`  Grid intensity: ${gridCounts.live} live, ${gridCounts.fallback} fallback, ${gridCounts.unknown} unknown`);
         console.log('');
         console.log(`  ${'Metric'.padEnd(26)} ${'Measured'.padStart(12)} ${'Attributed'.padStart(12)} ${'Unattributed'.padStart(14)}`);
         console.log(`  ${'-'.repeat(26)} ${'-'.repeat(12)} ${'-'.repeat(12)} ${'-'.repeat(14)}`);
@@ -159,7 +176,14 @@ function printReport(result) {
         const pw_m  = fmt(m.power_watts,   4);
         const pw_a  = fmt(att.power_watts,  4);
         const pw_u  = fmt(un.power_watts,   4);
-        console.log(`  ${'Power (W avg)'.padEnd(26)} ${pw_m.padStart(12)} ${pw_a.padStart(12)} ${pw_u.padStart(14)}`);
+        console.log(`  ${'Average Power (W)'.padEnd(26)} ${pw_m.padStart(12)} ${pw_a.padStart(12)} ${pw_u.padStart(14)}`);
+
+        console.log(`  ${'Peak Power (W)'.padEnd(26)} ${fmt(m.peak_power_watts, 4).padStart(12)} ${'N/A'.padStart(12)} ${'N/A'.padStart(14)}`);
+
+        const energy_m = `${fmt(m.energy_wh, 4)} Wh (${fmt(m.energy_kwh, 8)} kWh)`;
+        const energy_a = `${fmt(att.energy_wh, 4)} Wh`;
+        const energy_u = `${fmt(un.energy_wh, 4)} Wh`;
+        console.log(`  ${'Total Energy'.padEnd(26)} ${energy_m.padStart(12)} ${energy_a.padStart(12)} ${energy_u.padStart(14)}`);
 
         const co2_m = fmt(m.carbon_gco2e,  6);
         const co2_a = fmt(att.carbon_gco2e, 6);
@@ -173,8 +197,41 @@ function printReport(result) {
 
         console.log('');
         console.log(`  Reconciliation : measured = attributed + unattributed  ✓`);
+        console.log(`  Attribution version: ${r.attribution_version ?? 'N/A'}`);
         console.log(`  Attribution    : ${coverage !== null ? coverage + '%' : 'N/A'}`);
         console.log(`  Evidence       : ${evidenceLabel}`);
+    }
+
+    if (result.baselineComparison) {
+        console.log('  BASELINE COMPARISON');
+        console.log(LINE);
+        console.log(`  Baseline run: ${result.baselineComparison.run_id} (${result.baselineComparison.measurement_quality})`);
+        for (const metric of Object.values(result.baselineComparison.metrics)) {
+            const absolute = metric.absolute_delta == null ? 'N/A' : fmt(metric.absolute_delta, 4);
+            const percent = metric.percent_change == null ? 'N/A' : `${fmt(metric.percent_change, 1)}%`;
+            console.log(`  ${metric.label.padEnd(28)} Δ ${absolute.padStart(12)} (${percent})`);
+        }
+        console.log('');
+    }
+
+    if (result.insights) {
+        console.log('  INSIGHTS');
+        console.log(LINE);
+        for (const label of ['OBSERVED', 'LIKELY CONTRIBUTOR', 'EVIDENCE', 'RECOMMENDATION']) {
+            console.log(`  ${label}`);
+            const entries = result.insights[label] ?? [];
+            for (const entry of entries) {
+                const content = typeof entry === 'string' ? entry : JSON.stringify(entry);
+                console.log(`    • ${content}`);
+            }
+        }
+        console.log('');
+    }
+    if (result.aiExplanation) {
+        console.log('  AI EXPLANATION');
+        console.log(LINE);
+        console.log(`  ${result.aiExplanation}`);
+        console.log('');
     }
 
     console.log('');
@@ -185,7 +242,18 @@ function printReport(result) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
-    const args = parseArgs(process.argv.slice(2));
+    const argv = process.argv.slice(2);
+    if (argv[0] === 'service') {
+        try {
+            const { manageService } = await import('../src/transparency/service.js');
+            manageService(argv[1]);
+        } catch (err) {
+            console.error(`[EcoPrint] ${err.message}`);
+            process.exit(2);
+        }
+        return;
+    }
+    const args = parseArgs(argv);
 
     process.stdout.write(
         `\n[EcoPrint] Starting transparency measurement for "${args.name}"...\n`

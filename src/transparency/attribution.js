@@ -63,6 +63,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { dbRun, dbGet, dbAll } from './db.js';
+import { summarizeTelemetry } from './metrics.js';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -160,8 +161,9 @@ export async function attributeTelemetryWindow(db, { telemetry, windowStart, win
         const pw  = row.total_power_watts  ?? 0;
         const co2 = row.carbon_gCO2e       ?? 0;
         const h2o = row.water_liters       ?? 0;
+        const durationSeconds = row.interval_seconds ?? row.delta_time ?? 0;
 
-        const matches = await findOverlappingContexts(db, ts, rid);
+        const matches = await findOverlappingContexts(db, row.attribution_timestamp ?? ts, rid);
 
         if (matches.length === 0) {
             // Rule 3 — no matching context
@@ -175,6 +177,7 @@ export async function attributeTelemetryWindow(db, { telemetry, windowStart, win
                 attributedPowerWatts:  pw,
                 attributedCarbonGco2e: co2,
                 attributedWaterLiters: h2o,
+                durationSeconds,
                 attributionMethod:     'no-context-match',
                 evidenceLevel:         'unattributed',
                 version:               ver,
@@ -195,6 +198,7 @@ export async function attributeTelemetryWindow(db, { telemetry, windowStart, win
                 attributedPowerWatts:  pw,
                 attributedCarbonGco2e: co2,
                 attributedWaterLiters: h2o,
+                durationSeconds,
                 attributionMethod:     'exact-context-match',
                 evidenceLevel:         'exact',
                 version:               ver,
@@ -217,6 +221,7 @@ export async function attributeTelemetryWindow(db, { telemetry, windowStart, win
                     attributedPowerWatts:  pw  * share,
                     attributedCarbonGco2e: co2 * share,
                     attributedWaterLiters: h2o * share,
+                    durationSeconds,
                     attributionMethod:     `equal-share-${n}-contexts`,
                     evidenceLevel:         'shared',
                     version:               ver,
@@ -355,44 +360,39 @@ export async function getUnattributedTelemetry(db, { windowStart, windowEnd }) {
  * }>}
  */
 export async function reconcileAttribution(db, { windowStart, windowEnd, telemetry }) {
-    // Measured totals come from the raw telemetry input — one row per observation.
-    // For multi-context splits, each observation is counted once in measured.
-    const measured = telemetry.reduce(
-        (acc, row) => {
-            acc.power_watts  += row.total_power_watts ?? 0;
-            acc.carbon_gco2e += row.carbon_gCO2e      ?? 0;
-            acc.water_liters += row.water_liters       ?? 0;
-            return acc;
-        },
-        { power_watts: 0, carbon_gco2e: 0, water_liters: 0 }
-    );
+    const measured = summarizeTelemetry(telemetry);
 
     // Attributed and unattributed from the attribution_records table.
     const rows = await dbAll(
         db,
-        `SELECT evidence_level,
-                SUM(attributed_power_watts)   AS pw,
+         `SELECT evidence_level,
+                attribution_version,
+                SUM(attributed_power_watts * duration_seconds) AS watt_seconds,
                 SUM(attributed_carbon_gco2e)  AS co2,
                 SUM(attributed_water_liters)  AS h2o
          FROM   attribution_records
          WHERE  telemetry_timestamp >= ? AND telemetry_timestamp <= ?
-         GROUP  BY evidence_level`,
-        [windowStart, windowEnd]
+           AND  attribution_version = (
+                SELECT MAX(attribution_version) FROM attribution_records
+                WHERE telemetry_timestamp >= ? AND telemetry_timestamp <= ?
+           )
+         GROUP  BY evidence_level, attribution_version`,
+        [windowStart, windowEnd, windowStart, windowEnd]
     );
 
-    const attributed   = { power_watts: 0, carbon_gco2e: 0, water_liters: 0 };
-    const unattributed = { power_watts: 0, carbon_gco2e: 0, water_liters: 0 };
+    const attributed   = { power_watts: 0, energy_wh: 0, carbon_gco2e: 0, water_liters: 0 };
+    const unattributed = { power_watts: 0, energy_wh: 0, carbon_gco2e: 0, water_liters: 0 };
 
     for (const r of rows) {
-        if (r.evidence_level === 'unattributed') {
-            unattributed.power_watts  += r.pw  ?? 0;
-            unattributed.carbon_gco2e += r.co2 ?? 0;
-            unattributed.water_liters += r.h2o ?? 0;
-        } else {
-            attributed.power_watts  += r.pw  ?? 0;
-            attributed.carbon_gco2e += r.co2 ?? 0;
-            attributed.water_liters += r.h2o ?? 0;
-        }
+        const target = r.evidence_level === 'unattributed' ? unattributed : attributed;
+        target.energy_wh += (r.watt_seconds ?? 0) / 3600;
+        target.carbon_gco2e += r.co2 ?? 0;
+        target.water_liters += r.h2o ?? 0;
+    }
+
+    for (const target of [attributed, unattributed]) {
+        target.power_watts = measured.duration_seconds > 0
+            ? target.energy_wh * 3600 / measured.duration_seconds : 0;
     }
 
     return {
@@ -400,6 +400,7 @@ export async function reconcileAttribution(db, { windowStart, windowEnd, telemet
         measured,
         attributed,
         unattributed,
+        attribution_version: rows.length ? rows[0].attribution_version : null,
     };
 }
 
@@ -415,6 +416,7 @@ async function _insertAttribution(db, {
     attributedPowerWatts,
     attributedCarbonGco2e,
     attributedWaterLiters,
+    durationSeconds = 0,
     attributionMethod,
     evidenceLevel,
     version,
@@ -428,12 +430,13 @@ async function _insertAttribution(db, {
              attribution_id, telemetry_timestamp,
              workload_id, run_id, attempt_id, context_id, resource_id,
              attributed_power_watts, attributed_carbon_gco2e, attributed_water_liters,
-             attribution_method, evidence_level, attribution_version, created_at
-         ) VALUES (?,?, ?,?,?,?,?, ?,?,?, ?,?,?,?)`,
+             duration_seconds, attribution_method, evidence_level, attribution_version, created_at
+         ) VALUES (?,?, ?,?,?,?,?, ?,?,?, ?,?,?,?,?)`,
         [
             attribution_id, telemetryTimestamp,
             workloadId, runId, attemptId, contextId, resourceId,
             attributedPowerWatts, attributedCarbonGco2e, attributedWaterLiters,
+            durationSeconds,
             attributionMethod, evidenceLevel, version, createdAt,
         ]
     );
@@ -449,6 +452,7 @@ async function _insertAttribution(db, {
         attributed_power_watts:   attributedPowerWatts,
         attributed_carbon_gco2e:  attributedCarbonGco2e,
         attributed_water_liters:  attributedWaterLiters,
+        duration_seconds:         durationSeconds,
         attribution_method:       attributionMethod,
         evidence_level:           evidenceLevel,
         attribution_version:      version,

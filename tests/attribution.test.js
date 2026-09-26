@@ -76,6 +76,7 @@ function tRow(timestamp, { resourceId = null, power = 1.0, carbon = 0.001, water
         total_power_watts:  power,
         carbon_gCO2e:       carbon,
         water_liters:       water,
+        interval_seconds:   1,
     };
 }
 
@@ -599,8 +600,9 @@ describe('Transparency Deterministic Attribution', () => {
 
         after(() => closeDatabase(db));
 
-        it('measured power equals sum of all telemetry rows', () => {
-            assert.ok(Math.abs(report.measured.power_watts - 6.0) < 1e-10);
+        it('measured power is the time-weighted average, not a sample sum', () => {
+            assert.ok(Math.abs(report.measured.power_watts - 2.0) < 1e-10);
+            assert.ok(Math.abs(report.measured.peak_power_watts - 3.0) < 1e-10);
         });
 
         it('attributed + unattributed power equals measured power', () => {
@@ -621,6 +623,36 @@ describe('Transparency Deterministic Attribution', () => {
         it('report window matches the queried range', () => {
             assert.equal(report.window.start, WIN_START);
             assert.equal(report.window.end,   WIN_END);
+        });
+    });
+
+    describe('reconciliation uses only the current attribution version', () => {
+        let db;
+        after(() => closeDatabase(db));
+
+        it('does not double-count when the same window is attributed again', async () => {
+            db = await freshDb();
+            const { workload, run, attempt } = await scaffoldAttempt(db);
+            const timestamp = '2099-09-01T00:00:02.000Z';
+            await insertCtx(db, {
+                contextId: 'ctx-version', workloadId: workload.workload_id,
+                runId: run.run_id, attemptId: attempt.attempt_id,
+                externalId: '42', resourceId: 'node-a',
+                startedAt: '2099-09-01T00:00:00.000Z',
+                endedAt: '2099-09-01T00:00:03.000Z',
+            });
+            const telemetry = [tRow(timestamp, { resourceId: 'node-a', power: 12 })];
+            const window = {
+                windowStart: '2099-09-01T00:00:00.000Z',
+                windowEnd: '2099-09-01T00:00:03.000Z',
+            };
+            await attributeTelemetryWindow(db, { ...window, telemetry });
+            const first = await reconcileAttribution(db, { ...window, telemetry });
+            await attributeTelemetryWindow(db, { ...window, telemetry });
+            const second = await reconcileAttribution(db, { ...window, telemetry });
+            assert.equal(first.attributed.power_watts, 12);
+            assert.equal(second.attributed.power_watts, 12);
+            assert.equal(second.attribution_version, first.attribution_version + 1);
         });
     });
 

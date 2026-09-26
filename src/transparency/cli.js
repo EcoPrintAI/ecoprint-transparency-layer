@@ -33,7 +33,12 @@ import {
     reconcileAttribution,
 } from './index.js';
 
-import { dbRun }                              from './db.js';
+import { dbRun, dbGet }                       from './db.js';
+import { findBaseline, compareRunMetrics, saveRunMetrics } from './baseline.js';
+import { deriveInsights } from './insights.js';
+import { explainWithProvider } from './ai.js';
+import { prepareTelemetryRows } from './metrics.js';
+import { sendIpcCommand }                      from './ipc.js';
 import { openSigSenseDb, closeSigSenseDb,
          readTelemetryWindow,
          DEFAULT_SIGSENSE_DB }                from './telemetry.js';
@@ -44,7 +49,8 @@ import { openSigSenseDb, closeSigSenseDb,
 import path         from 'node:path';
 import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-export const DEFAULT_TRANSPARENCY_DB = path.resolve(__dirname, 'transparency.db');
+export const DEFAULT_TRANSPARENCY_DB = process.env.ECOPRINT_TRANSPARENCY_DB ??
+    path.resolve(__dirname, 'transparency.db');
 
 // ── Main entry point ──────────────────────────────────────────────────────────
 
@@ -71,6 +77,8 @@ export async function runUnderTransparency(opts) {
         sigsenseDb     = DEFAULT_SIGSENSE_DB,
         spawnFn        = spawn,
         telemetryFn    = null,
+        ipcFn          = sendIpcCommand,
+        aiProvider     = null,
     } = opts;
 
     // ── 1. Open Transparency database ─────────────────────────────────────────
@@ -78,7 +86,10 @@ export async function runUnderTransparency(opts) {
     await initSchema(db);
 
     // ── 2. Identity ───────────────────────────────────────────────────────────
-    const workload = await createWorkload(db, { name: workloadName, type: workloadType });
+    let workload = await dbGet(db,
+        `SELECT * FROM workloads WHERE name = ? AND type = ? AND status = 'active' ORDER BY created_at ASC LIMIT 1`,
+        [workloadName, workloadType]);
+    if (!workload) workload = await createWorkload(db, { name: workloadName, type: workloadType });
     const run      = await startRun(db, { workloadId: workload.workload_id });
     const attempt  = await startAttempt(db, { runId: run.run_id, workloadId: workload.workload_id });
 
@@ -86,9 +97,18 @@ export async function runUnderTransparency(opts) {
 
     // ── 3. Spawn child process ────────────────────────────────────────────────
     const [cmd, ...args] = command;
-    const startedAt = new Date().toISOString();
     let   childPid  = null;
     let   exitCode  = null;
+    let   ipcStarted = false;
+    let   ipcError = null;
+    try {
+        await ipcFn(`BEGIN ${run.run_id}`);
+        ipcStarted = true;
+    } catch (err) {
+        ipcError = err.message;
+    }
+
+    const startedAt = new Date().toISOString();
 
     const childResult = await new Promise((resolve) => {
         let child;
@@ -112,6 +132,13 @@ export async function runUnderTransparency(opts) {
 
     exitCode = childResult.code;
     const endedAt = new Date().toISOString();
+    if (ipcStarted) {
+        try {
+            await ipcFn(`END ${run.run_id}`);
+        } catch (err) {
+            ipcError ??= err.message;
+        }
+    }
 
     // ── 4. Record process context ─────────────────────────────────────────────
     // Insert context with exact start/end timestamps directly (bypass now())
@@ -167,6 +194,8 @@ export async function runUnderTransparency(opts) {
         telemetryRows  = [];
     }
 
+    telemetryRows = prepareTelemetryRows(telemetryRows, startedAt, endedAt);
+
     // ── 7. Run deterministic attribution ──────────────────────────────────────
     // The attribution window is the actual range of telemetry timestamps,
     // not the process start/end time.  This ensures reconciliation queries
@@ -197,6 +226,47 @@ export async function runUnderTransparency(opts) {
     // ── 9. Compute duration ───────────────────────────────────────────────────
     const durationMs = new Date(endedAt).getTime() - new Date(startedAt).getTime();
 
+    const sources = new Set(telemetryRows.map(row => row.measurement_source ?? 'unknown'));
+    const measurementQuality = telemetryRows.length === 0 ? 'unavailable'
+        : sources.size > 1 ? 'mixed'
+            : [...sources][0];
+    const gridSources = new Set(telemetryRows.map(row => row.grid_intensity_source ?? 'unknown'));
+    const gridIntensityQuality = telemetryRows.length === 0 ? 'unavailable'
+        : gridSources.size > 1 ? 'mixed'
+            : [...gridSources][0] === 'electricity-maps-live' ? 'live' : [...gridSources][0];
+    const rawAttributionCoverage = reconciliation.measured.power_watts > 0
+        ? reconciliation.attributed.power_watts / reconciliation.measured.power_watts * 100 : 0;
+    const attributionCoverage = rawAttributionCoverage >= 100 - 1e-9
+        ? 100 : Math.min(100, Math.max(0, rawAttributionCoverage));
+    const runMetrics = {
+        duration_ms: durationMs,
+        average_power_watts: reconciliation.measured.power_watts,
+        peak_power_watts: reconciliation.measured.peak_power_watts,
+        energy_wh: reconciliation.measured.energy_wh,
+        carbon_gco2e: reconciliation.measured.carbon_gco2e,
+        water_liters: reconciliation.measured.water_liters,
+        attribution_coverage: attributionCoverage,
+        measurement_quality: measurementQuality,
+        grid_intensity_quality: gridIntensityQuality,
+    };
+    const baseline = await findBaseline(db, workload.workload_id, run.run_id);
+    const baselineComparison = baseline
+        ? { run_id: baseline.baseline_run_id, ended_at: baseline.baseline_ended_at,
+            measurement_quality: baseline.measurement_quality,
+            grid_intensity_quality: baseline.grid_intensity_quality ?? 'unknown',
+            metrics: compareRunMetrics(runMetrics, baseline) }
+        : null;
+    await saveRunMetrics(db, run.run_id, runMetrics);
+    const insights = deriveInsights({
+        baselineComparison,
+        currentMetrics: runMetrics,
+        telemetryCount: telemetryRows.length,
+        resourceId,
+    });
+    const aiExplanation = aiProvider
+        ? await explainWithProvider({ facts: runMetrics, insights, provider: aiProvider })
+        : null;
+
     // ── 10. Close Transparency DB ─────────────────────────────────────────────
     await new Promise((resolve) => db.close(() => resolve()));
 
@@ -220,10 +290,15 @@ export async function runUnderTransparency(opts) {
         // Telemetry
         telemetryRows,
         telemetryError,
+        ipcError,
         telemetryCount: telemetryRows.length,
 
         // Attribution
         reconciliation,
+        runMetrics,
+        baselineComparison,
+        insights,
+        aiExplanation,
     };
 }
 

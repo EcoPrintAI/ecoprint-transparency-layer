@@ -4,10 +4,14 @@
 #include <string>
 #include <atomic>
 #include <thread>
+#include <set>
+#include <mutex>
+#include <functional>
 
 class IPCListener {
 public:
-    IPCListener(const std::string& path, std::atomic<bool>& keepRunningRef);
+    IPCListener(const std::string& path, std::atomic<bool>& keepRunningRef,
+                std::function<void(bool)> telemetryStateChanged = {});
     ~IPCListener();
 
     void start();
@@ -18,10 +22,15 @@ private:
 
     std::string socketPath;
     std::atomic<bool>& keepRunning;
-    bool listening;
+    std::atomic<bool> listening;
+    std::function<void(bool)> telemetryStateChanged;
 #ifndef _WIN32
     int serverFd;
+#else
+    void* serverHandle;
 #endif
+    std::set<std::string> activeRuns;
+    std::mutex runsMutex;
     std::thread listenerThread;
 };
 

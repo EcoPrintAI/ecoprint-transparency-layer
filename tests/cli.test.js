@@ -16,6 +16,9 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os, { tmpdir } from 'node:os';
+import path from 'node:path';
 
 import { runUnderTransparency }   from '../src/transparency/cli.js';
 import { openDatabase, initSchema, closeDatabase } from '../src/transparency/index.js';
@@ -68,6 +71,7 @@ function tRow(ts, power = 0.32, carbon = 0.000047, water = 0.00000017) {
         total_power_watts: power,
         carbon_gCO2e:      carbon,
         water_liters:      water,
+        interval_seconds:  1,
     };
 }
 
@@ -77,15 +81,48 @@ async function runCli(overrides = {}) {
         workloadName:   overrides.workloadName  ?? 'test-workload',
         workloadType:   overrides.workloadType  ?? 'cli-run',
         command:        overrides.command       ?? ['echo', 'hello'],
-        transparencyDb: ':memory:',
+        transparencyDb: overrides.transparencyDb ?? ':memory:',
         spawnFn:        overrides.spawnFn       ?? fakeSpawn(),
-        telemetryFn:    overrides.telemetryFn   ?? fakeTelemetry([]),
+        telemetryFn:    overrides.telemetryFn
+            ? async (start, end, resource) => (await overrides.telemetryFn(start, end, resource))
+                .map(row => row.timestamp?.startsWith('2099-') ? { ...row, timestamp: end } : row)
+            : fakeTelemetry([]),
+        ipcFn:          overrides.ipcFn          ?? (async () => 'OK COLLECTING'),
     });
 }
 
 // ── Test suites ───────────────────────────────────────────────────────────────
 
 describe('EcoPrint Transparency CLI', () => {
+
+    it('compares the actual baseline measurement sources in deterministic insights', async () => {
+        const directory = await mkdtemp(path.join(tmpdir(), 'ecoprint-cli-baseline-'));
+        try {
+            const telemetryFn = () => Promise.resolve([{
+                ...tRow('2099-06-01T00:01:00.000Z', 2, 0.001, 0.000004),
+                resource_id: os.hostname(),
+                measurement_source: 'hardware',
+                grid_intensity_source: 'electricity-maps-live',
+            }]);
+            const run = () => runCli({
+                workloadName: 'baseline-source-test',
+                transparencyDb: path.join(directory, 'transparency.db'),
+                telemetryFn,
+            });
+
+            await run();
+            const current = await run();
+
+            assert.equal(current.baselineComparison.measurement_quality, 'hardware');
+            assert.equal(current.baselineComparison.grid_intensity_quality, 'live');
+            assert.equal(current.runMetrics.attribution_coverage, 100);
+            assert.ok(!current.insights.OBSERVED.some(line => line.includes('Grid intensity source differs')));
+            assert.ok(!current.insights.RECOMMENDATION.some(line => line.includes('Check whether live grid-intensity')));
+            assert.ok(!current.insights.RECOMMENDATION.some(line => line.includes('Inspect unattributed telemetry')));
+        } finally {
+            await rm(directory, { recursive: true, force: true });
+        }
+    });
 
     // ── 1. Successful command execution ───────────────────────────────────────
     describe('successful command execution', () => {
@@ -256,7 +293,8 @@ describe('EcoPrint Transparency CLI', () => {
         });
 
         it('reconciliation.measured.carbon_gco2e equals the injected row', () => {
-            assert.ok(Math.abs(result.reconciliation.measured.carbon_gco2e - 0.005) < 1e-9);
+            const expected = result.telemetryRows[0].carbon_gCO2e;
+            assert.ok(Math.abs(result.reconciliation.measured.carbon_gco2e - expected) < 1e-9);
         });
     });
 
@@ -295,8 +333,8 @@ describe('EcoPrint Transparency CLI', () => {
             assert.ok(Math.abs(total - r.measured.water_liters) < 1e-9);
         });
 
-        it('measured power equals sum of all injected rows', () => {
-            assert.ok(Math.abs(result.reconciliation.measured.power_watts - 5.0) < 1e-9);
+        it('measured power is the time-weighted average of injected rows', () => {
+            assert.ok(Math.abs(result.reconciliation.measured.power_watts - 2.5) < 1e-9);
         });
     });
 
@@ -396,6 +434,40 @@ describe('EcoPrint Transparency CLI', () => {
             assert.ok(result.workload.workload_id);
             assert.ok(result.run.run_id);
             assert.ok(result.attempt.attempt_id);
+        });
+    });
+
+    describe('service run markers', () => {
+        it('sends BEGIN before command start and END after command completion', async () => {
+            const commands = [];
+            const result = await runCli({ ipcFn: async command => {
+                commands.push(command);
+                return 'OK COLLECTING';
+            } });
+            assert.deepEqual(commands, [`BEGIN ${result.run.run_id}`, `END ${result.run.run_id}`]);
+            assert.equal(result.ipcError, null);
+        });
+    });
+
+    describe('persistent workload baselines', () => {
+        it('reuses a named workload and compares its next completed run', async () => {
+            const dir = await mkdtemp(path.join(tmpdir(), 'ecoprint-baseline-'));
+            const dbPath = path.join(dir, 'transparency.db');
+            try {
+                const execute = power => runUnderTransparency({
+                    workloadName: 'same-build', workloadType: 'cli-run', command: ['echo', 'build'],
+                    transparencyDb: dbPath, spawnFn: fakeSpawn({ exitCode: 0 }),
+                    ipcFn: async () => 'OK COLLECTING',
+                    telemetryFn: async (_start, end) => [tRow(end, power, 0.01, 0.001)],
+                });
+                const first = await execute(12);
+                const second = await execute(18);
+                assert.equal(second.workload.workload_id, first.workload.workload_id);
+                assert.equal(second.baselineComparison.run_id, first.run.run_id);
+                assert.ok(Math.abs(second.baselineComparison.metrics.average_power_watts.absolute_delta - 6) < 1e-9);
+            } finally {
+                await rm(dir, { recursive: true, force: true });
+            }
         });
     });
 
