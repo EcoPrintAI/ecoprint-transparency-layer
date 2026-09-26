@@ -75,6 +75,29 @@ export {
     getContextsInWindow,
 } from './context.js';
 
+// Attribution layer
+export {
+    attributeTelemetryWindow,
+    recomputeAttribution,
+    getAttribution,
+    getAttemptAttribution,
+    getWorkloadAttribution,
+    getUnattributedTelemetry,
+    reconcileAttribution,
+    ATTRIBUTION_VERSION,
+} from './attribution.js';
+
+// Telemetry read adapter (SigSense)
+export {
+    openSigSenseDb,
+    closeSigSenseDb,
+    readTelemetryWindow,
+    DEFAULT_SIGSENSE_DB,
+} from './telemetry.js';
+
+// CLI lifecycle orchestrator
+export { runUnderTransparency, DEFAULT_TRANSPARENCY_DB } from './cli.js';
+
 // Identity propagation
 export {
     ENV_WORKLOAD_ID,

@@ -10,7 +10,10 @@
     "preview": "vite preview",
     "test": "node --test tests/**/*.test.js",
     "test:transparency": "node --test tests/transparency.test.js",
-    "test:context": "node --test tests/context.test.js"
+    "test:context": "node --test tests/context.test.js",
+    "test:attribution": "node --test tests/attribution.test.js",
+    "test:cli": "node --test tests/cli.test.js",
+    "ecoprint": "node bin/ecoprint.js"
   },
   "dependencies": {
     "@revenuecat/purchases-js": "^1.1.0",
