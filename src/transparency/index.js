@@ -1,5 +1,5 @@
 /**
- * index.js — Public API for the EcoPrint Transparency Identity Core.
+ * index.js — Public API for the EcoPrint Transparency layer.
  *
  * Import from this module rather than from individual internal files.
  *
@@ -10,6 +10,8 @@
  *     createWorkload, startRun, startAttempt,
  *     completeAttempt, completeRun,
  *     getWorkloadTimeline,
+ *     startContext, endContext,
+ *     getAttemptContexts, getWorkloadContextTimeline, getContextsInWindow,
  *     buildIdentityEnv, readIdentityEnv,
  *   } from './src/transparency/index.js';
  *
@@ -20,17 +22,29 @@
  *   const run      = await startRun(db,     { workloadId: workload.workload_id });
  *   const attempt  = await startAttempt(db, { runId: run.run_id, workloadId: workload.workload_id });
  *
- *   // propagate to a child process
+ *   // record the process context for this attempt
+ *   const ctx = await startContext(db, {
+ *     workloadId: workload.workload_id,
+ *     runId:      run.run_id,
+ *     attemptId:  attempt.attempt_id,
+ *     externalId: String(process.pid),
+ *     source:     'transparency-launch',
+ *     resourceId: os.hostname(),
+ *   });
+ *
+ *   // propagate identity to a child process
  *   const childEnv = buildIdentityEnv({
  *     workloadId: workload.workload_id,
  *     runId:      run.run_id,
  *     attemptId:  attempt.attempt_id,
  *   });
  *
+ *   await endContext(db,      { contextId: ctx.context_id });
  *   await completeAttempt(db, { attemptId: attempt.attempt_id, status: 'completed' });
  *   await completeRun(db,     { runId: run.run_id, status: 'completed' });
  *
  *   const timeline = await getWorkloadTimeline(db, workload.workload_id);
+ *   const ctxs     = await getAttemptContexts(db,  attempt.attempt_id);
  *
  *   await closeDatabase(db);
  */
@@ -50,6 +64,16 @@ export {
     getAttempt,
     getWorkloadTimeline,
 } from './identity.js';
+
+// Context timeline service
+export {
+    startContext,
+    endContext,
+    getContext,
+    getAttemptContexts,
+    getWorkloadContextTimeline,
+    getContextsInWindow,
+} from './context.js';
 
 // Identity propagation
 export {
