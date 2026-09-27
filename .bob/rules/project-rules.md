@@ -4,7 +4,12 @@
 - This project is a hackathon prototype and must remain separate from proprietary EcoPrint systems.
 - Do not import, copy, recreate, or modify proprietary EcoPrint components unless explicitly instructed.
 - Do not assume access to SigSense, Connect, or other proprietary EcoPrint code.
-- Treat telemetry-engine implementation details as protected unless explicitly approved.
+- SigSense may be modified only when necessary to implement, validate, harden, or expose the EcoPrint self-measurement, workload/process provenance, attribution, measurement-quality, or related accounting architecture in the current task.
+- Keep SigSense changes scoped to this task. Preserve existing raw telemetry contracts where reasonably possible, do not create duplicate raw telemetry systems or a second raw telemetry database, avoid unrelated refactoring/cleanup, and preserve backwards compatibility where practical.
+- Add or update tests for every behavioral change.
+- Identify each SigSense change as either required for the current implementation or a directly related hardening/improvement discovered during implementation.
+- Document useful SigSense improvements discovered in this work for later upstreaming into the canonical SigSense repository.
+- This is a narrow task authorization and does not permit unrelated SigSense redesign.
 
 ## Development Workflow
 - Make the smallest necessary change for each task.

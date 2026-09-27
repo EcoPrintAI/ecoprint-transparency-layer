@@ -76,6 +76,21 @@ function now() {
     return new Date().toISOString();
 }
 
+function componentPowers(row, share = 1) {
+    return Object.fromEntries(['cpu', 'gpu', 'ane', 'client_workload', 'ecoprint_overhead'].map(component => {
+        const value = row[`${component}_power_watts`];
+        return [component, value == null || !Number.isFinite(Number(value)) ? null : Number(value) * share];
+    }));
+}
+
+function allocationEnvironment(row, share = 1) {
+    return Object.fromEntries(['carbon_gCO2e', 'water_liters'].flatMap(metric =>
+        ['client_workload', 'ecoprint_overhead'].map(component => {
+            const key = `${component}_${metric}`;
+            return [key, row[key] == null || !Number.isFinite(Number(row[key])) ? null : Number(row[key]) * share];
+        })));
+}
+
 /**
  * Find all context_events whose execution interval overlaps a single telemetry
  * timestamp, applying resource-identity matching where available.
@@ -99,6 +114,7 @@ async function findOverlappingContexts(db, ts, resourceId) {
         `SELECT * FROM context_events
          WHERE started_at <= ?
            AND (ended_at IS NULL OR ended_at >= ?)
+           AND attribution_eligible = 1
          ORDER BY context_id ASC`,   // stable sort for determinism
         [ts, ts]
     );
@@ -111,6 +127,50 @@ async function findOverlappingContexts(db, ts, resourceId) {
         // One or both sides lack resource identity — resource constraint skipped.
         return true;
     });
+}
+
+async function findIdentityContext(db, row) {
+    const sameResource = context => !context.resource_id || !row.resource_id || context.resource_id === row.resource_id;
+    const timestamp = row.attribution_timestamp ?? row.timestamp;
+    if (row.context_id) {
+        const direct = await dbGet(db,
+            `SELECT * FROM context_events WHERE context_id = ? AND attribution_eligible = 1
+             AND started_at <= ? AND (ended_at IS NULL OR ended_at >= ?)`, [row.context_id, timestamp, timestamp]);
+        if (direct && sameResource(direct)) return { context: direct, method: 'direct-context-identity' };
+    }
+    if (row.attempt_id || row.run_id || row.workload_id) {
+        const direct = await dbGet(db, `SELECT * FROM context_events
+            WHERE attribution_eligible = 1
+              AND (? IS NULL OR attempt_id = ?)
+              AND (? IS NULL OR run_id = ?)
+              AND (? IS NULL OR workload_id = ?)
+              AND started_at <= ? AND (ended_at IS NULL OR ended_at >= ?)
+            ORDER BY context_id LIMIT 1`, [
+            row.attempt_id ?? null, row.attempt_id ?? null,
+            row.run_id ?? null, row.run_id ?? null,
+            row.workload_id ?? null, row.workload_id ?? null,
+            timestamp, timestamp,
+        ]);
+        if (direct && sameResource(direct)) return { context: direct, method: 'authoritative-workload-identity' };
+    }
+    if (row.process_id != null) {
+        let process = await dbGet(db, `SELECT * FROM context_events WHERE process_id = ?
+            AND started_at <= ? AND (ended_at IS NULL OR ended_at >= ?)`, [row.process_id, timestamp, timestamp]);
+        const seen = new Set();
+        let usedLineage = false;
+        while (process && !seen.has(process.process_id)) {
+            if (process.attribution_eligible === 1) {
+                if (sameResource(process)) return { context: process, method: usedLineage ? 'parent-lineage-match' : 'direct-process-identity' };
+                return null;
+            }
+            seen.add(process.process_id);
+            process = process.parent_process_id == null ? null
+                : await dbGet(db, `SELECT * FROM context_events WHERE process_id = ?
+                    AND started_at <= ? AND (ended_at IS NULL OR ended_at >= ?)`, [process.parent_process_id, timestamp, timestamp]);
+            usedLineage = true;
+        }
+    }
+    return null;
 }
 
 /**
@@ -163,7 +223,9 @@ export async function attributeTelemetryWindow(db, { telemetry, windowStart, win
         const h2o = row.water_liters       ?? 0;
         const durationSeconds = row.interval_seconds ?? row.delta_time ?? 0;
 
-        const matches = await findOverlappingContexts(db, row.attribution_timestamp ?? ts, rid);
+        const identityMatch = await findIdentityContext(db, row);
+        const matches = identityMatch ? [identityMatch.context]
+            : await findOverlappingContexts(db, row.attribution_timestamp ?? ts, rid);
 
         if (matches.length === 0) {
             // Rule 3 — no matching context
@@ -175,6 +237,8 @@ export async function attributeTelemetryWindow(db, { telemetry, windowStart, win
                 contextId:             null,
                 resourceId:            rid,
                 attributedPowerWatts:  pw,
+                attributedComponentPowerWatts: componentPowers(row),
+                attributedAllocationCarbon: allocationEnvironment(row),
                 attributedCarbonGco2e: co2,
                 attributedWaterLiters: h2o,
                 durationSeconds,
@@ -196,10 +260,12 @@ export async function attributeTelemetryWindow(db, { telemetry, windowStart, win
                 contextId:             ctx.context_id,
                 resourceId:            rid ?? ctx.resource_id,
                 attributedPowerWatts:  pw,
+                attributedComponentPowerWatts: componentPowers(row),
+                attributedAllocationCarbon: allocationEnvironment(row),
                 attributedCarbonGco2e: co2,
                 attributedWaterLiters: h2o,
                 durationSeconds,
-                attributionMethod:     'exact-context-match',
+                attributionMethod:     identityMatch?.method ?? 'exact-context-match',
                 evidenceLevel:         'exact',
                 version:               ver,
                 createdAt:             created,
@@ -219,6 +285,8 @@ export async function attributeTelemetryWindow(db, { telemetry, windowStart, win
                     contextId:             ctx.context_id,
                     resourceId:            rid ?? ctx.resource_id,
                     attributedPowerWatts:  pw  * share,
+                    attributedComponentPowerWatts: componentPowers(row, share),
+                    attributedAllocationCarbon: allocationEnvironment(row, share),
                     attributedCarbonGco2e: co2 * share,
                     attributedWaterLiters: h2o * share,
                     durationSeconds,
@@ -368,6 +436,15 @@ export async function reconcileAttribution(db, { windowStart, windowEnd, telemet
          `SELECT evidence_level,
                 attribution_version,
                 SUM(attributed_power_watts * duration_seconds) AS watt_seconds,
+                SUM(attributed_cpu_power_watts * duration_seconds) AS cpu_watt_seconds,
+                SUM(attributed_gpu_power_watts * duration_seconds) AS gpu_watt_seconds,
+                SUM(attributed_ane_power_watts * duration_seconds) AS ane_watt_seconds,
+                SUM(attributed_client_workload_power_watts * duration_seconds) AS client_watt_seconds,
+                SUM(attributed_ecoprint_overhead_power_watts * duration_seconds) AS overhead_watt_seconds,
+                SUM(attributed_client_workload_carbon_gco2e) AS client_carbon_gco2e,
+                SUM(attributed_ecoprint_overhead_carbon_gco2e) AS overhead_carbon_gco2e,
+                SUM(attributed_client_workload_water_liters) AS client_water_liters,
+                SUM(attributed_ecoprint_overhead_water_liters) AS overhead_water_liters,
                 SUM(attributed_carbon_gco2e)  AS co2,
                 SUM(attributed_water_liters)  AS h2o
          FROM   attribution_records
@@ -386,6 +463,17 @@ export async function reconcileAttribution(db, { windowStart, windowEnd, telemet
     for (const r of rows) {
         const target = r.evidence_level === 'unattributed' ? unattributed : attributed;
         target.energy_wh += (r.watt_seconds ?? 0) / 3600;
+        for (const component of ['cpu', 'gpu', 'ane']) {
+            target[`${component}_energy_wh`] = (target[`${component}_energy_wh`] ?? 0) + (r[`${component}_watt_seconds`] ?? 0) / 3600;
+        }
+        for (const component of ['client_workload', 'ecoprint_overhead']) {
+            const source = component === 'client_workload' ? 'client' : 'overhead';
+            target[`${component}_energy_wh`] = (target[`${component}_energy_wh`] ?? 0) + (r[`${source}_watt_seconds`] ?? 0) / 3600;
+            target[`${component}_carbon_gco2e`] = r[`${source}_carbon_gco2e`] == null
+                ? null : (target[`${component}_carbon_gco2e`] ?? 0) + r[`${source}_carbon_gco2e`];
+            target[`${component}_water_liters`] = r[`${source}_water_liters`] == null
+                ? null : (target[`${component}_water_liters`] ?? 0) + r[`${source}_water_liters`];
+        }
         target.carbon_gco2e += r.co2 ?? 0;
         target.water_liters += r.h2o ?? 0;
     }
@@ -393,6 +481,21 @@ export async function reconcileAttribution(db, { windowStart, windowEnd, telemet
     for (const target of [attributed, unattributed]) {
         target.power_watts = measured.duration_seconds > 0
             ? target.energy_wh * 3600 / measured.duration_seconds : 0;
+        for (const component of ['cpu', 'gpu', 'ane']) {
+            const duration = measured[`${component}_duration_seconds`];
+            target[`${component}_energy_wh`] = duration == null ? null : target[`${component}_energy_wh`] ?? 0;
+            target[`${component}_power_watts`] = duration == null
+                ? null : duration > 0 ? target[`${component}_energy_wh`] * 3600 / duration : 0;
+        }
+        for (const component of ['client_workload', 'ecoprint_overhead']) {
+            const duration = measured[`${component}_duration_seconds`];
+            target[`${component}_energy_wh`] = duration == null ? null : target[`${component}_energy_wh`] ?? 0;
+            target[`${component}_power_watts`] = duration == null ? null : duration > 0 ? target[`${component}_energy_wh`] * 3600 / duration : 0;
+            if (measured[`${component}_carbon_gco2e`] == null) {
+                target[`${component}_carbon_gco2e`] = null;
+                target[`${component}_water_liters`] = null;
+            }
+        }
     }
 
     return {
@@ -414,6 +517,8 @@ async function _insertAttribution(db, {
     contextId,
     resourceId,
     attributedPowerWatts,
+    attributedComponentPowerWatts = {},
+    attributedAllocationCarbon = {},
     attributedCarbonGco2e,
     attributedWaterLiters,
     durationSeconds = 0,
@@ -429,13 +534,27 @@ async function _insertAttribution(db, {
         `INSERT INTO attribution_records (
              attribution_id, telemetry_timestamp,
              workload_id, run_id, attempt_id, context_id, resource_id,
-             attributed_power_watts, attributed_carbon_gco2e, attributed_water_liters,
+             attributed_power_watts, attributed_cpu_power_watts, attributed_gpu_power_watts,
+             attributed_ane_power_watts, attributed_client_workload_power_watts,
+             attributed_ecoprint_overhead_power_watts, attributed_client_workload_carbon_gco2e,
+             attributed_ecoprint_overhead_carbon_gco2e, attributed_client_workload_water_liters,
+             attributed_ecoprint_overhead_water_liters, attributed_carbon_gco2e, attributed_water_liters,
              duration_seconds, attribution_method, evidence_level, attribution_version, created_at
-         ) VALUES (?,?, ?,?,?,?,?, ?,?,?, ?,?,?,?,?)`,
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
             attribution_id, telemetryTimestamp,
             workloadId, runId, attemptId, contextId, resourceId,
-            attributedPowerWatts, attributedCarbonGco2e, attributedWaterLiters,
+            attributedPowerWatts,
+            attributedComponentPowerWatts.cpu ?? null,
+            attributedComponentPowerWatts.gpu ?? null,
+            attributedComponentPowerWatts.ane ?? null,
+            attributedComponentPowerWatts.client_workload ?? null,
+            attributedComponentPowerWatts.ecoprint_overhead ?? null,
+            attributedAllocationCarbon.client_workload_carbon_gCO2e ?? null,
+            attributedAllocationCarbon.ecoprint_overhead_carbon_gCO2e ?? null,
+            attributedAllocationCarbon.client_workload_water_liters ?? null,
+            attributedAllocationCarbon.ecoprint_overhead_water_liters ?? null,
+            attributedCarbonGco2e, attributedWaterLiters,
             durationSeconds,
             attributionMethod, evidenceLevel, version, createdAt,
         ]
@@ -450,6 +569,15 @@ async function _insertAttribution(db, {
         context_id:               contextId,
         resource_id:              resourceId,
         attributed_power_watts:   attributedPowerWatts,
+        attributed_cpu_power_watts: attributedComponentPowerWatts.cpu ?? null,
+        attributed_gpu_power_watts: attributedComponentPowerWatts.gpu ?? null,
+        attributed_ane_power_watts: attributedComponentPowerWatts.ane ?? null,
+        attributed_client_workload_power_watts: attributedComponentPowerWatts.client_workload ?? null,
+        attributed_ecoprint_overhead_power_watts: attributedComponentPowerWatts.ecoprint_overhead ?? null,
+        attributed_client_workload_carbon_gco2e: attributedAllocationCarbon.client_workload_carbon_gCO2e ?? null,
+        attributed_ecoprint_overhead_carbon_gco2e: attributedAllocationCarbon.ecoprint_overhead_carbon_gCO2e ?? null,
+        attributed_client_workload_water_liters: attributedAllocationCarbon.client_workload_water_liters ?? null,
+        attributed_ecoprint_overhead_water_liters: attributedAllocationCarbon.ecoprint_overhead_water_liters ?? null,
         attributed_carbon_gco2e:  attributedCarbonGco2e,
         attributed_water_liters:  attributedWaterLiters,
         duration_seconds:         durationSeconds,

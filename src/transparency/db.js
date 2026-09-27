@@ -113,6 +113,14 @@ export async function initSchema(db) {
             ended_at          TEXT,
             source            TEXT    NOT NULL,
             parent_context_id TEXT    REFERENCES context_events(context_id)
+            ,process_id       INTEGER
+            ,parent_process_id INTEGER
+            ,executable_identity TEXT
+            ,process_started_at TEXT
+            ,process_start_quality TEXT
+            ,provenance_classification TEXT NOT NULL DEFAULT 'unknown'
+            ,provenance_source TEXT NOT NULL DEFAULT 'cli'
+            ,attribution_eligible INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE INDEX IF NOT EXISTS idx_ctx_attempt_id  ON context_events(attempt_id);
@@ -131,6 +139,15 @@ export async function initSchema(db) {
             context_id           TEXT,
             resource_id          TEXT,
             attributed_power_watts   REAL    NOT NULL DEFAULT 0.0,
+            attributed_cpu_power_watts REAL,
+            attributed_gpu_power_watts REAL,
+            attributed_ane_power_watts REAL,
+            attributed_client_workload_power_watts REAL,
+            attributed_ecoprint_overhead_power_watts REAL,
+            attributed_client_workload_carbon_gco2e REAL,
+            attributed_ecoprint_overhead_carbon_gco2e REAL,
+            attributed_client_workload_water_liters REAL,
+            attributed_ecoprint_overhead_water_liters REAL,
             attributed_carbon_gco2e  REAL    NOT NULL DEFAULT 0.0,
             attributed_water_liters  REAL    NOT NULL DEFAULT 0.0,
             duration_seconds        REAL    NOT NULL DEFAULT 0.0,
@@ -158,6 +175,31 @@ export async function initSchema(db) {
             attribution_coverage    REAL NOT NULL,
             measurement_quality     TEXT NOT NULL,
             grid_intensity_quality  TEXT NOT NULL DEFAULT 'unknown',
+            cpu_average_power_watts REAL,
+            cpu_peak_power_watts    REAL,
+            cpu_energy_wh           REAL,
+            gpu_average_power_watts REAL,
+            gpu_peak_power_watts    REAL,
+            gpu_energy_wh           REAL,
+            ane_average_power_watts REAL,
+            ane_peak_power_watts    REAL,
+            ane_energy_wh           REAL,
+            client_workload_average_power_watts REAL,
+            client_workload_peak_power_watts REAL,
+            client_workload_energy_wh REAL,
+            client_workload_carbon_gco2e REAL,
+            client_workload_water_liters REAL,
+            ecoprint_overhead_average_power_watts REAL,
+            ecoprint_overhead_peak_power_watts REAL,
+            ecoprint_overhead_energy_wh REAL,
+            ecoprint_overhead_carbon_gco2e REAL,
+            ecoprint_overhead_water_liters REAL,
+            measurement_efficiency_pct REAL,
+            measurement_method TEXT NOT NULL DEFAULT 'unknown',
+            allocation_method TEXT NOT NULL DEFAULT 'unavailable',
+            provenance_quality TEXT NOT NULL DEFAULT 'unknown',
+            process_context_count INTEGER NOT NULL DEFAULT 0,
+            process_lineage_coverage REAL,
             created_at              TEXT NOT NULL
         );
     `;
@@ -176,6 +218,33 @@ export async function initSchema(db) {
     await _addColumnIfMissing(db, 'runs',      'identity_source', "TEXT NOT NULL DEFAULT 'local'");
     await _addColumnIfMissing(db, 'attempts',  'identity_source', "TEXT NOT NULL DEFAULT 'local'");
     await _addColumnIfMissing(db, 'attribution_records', 'duration_seconds', 'REAL NOT NULL DEFAULT 0.0');
+    for (const name of [
+        'attributed_client_workload_power_watts', 'attributed_ecoprint_overhead_power_watts',
+        'attributed_client_workload_carbon_gco2e', 'attributed_ecoprint_overhead_carbon_gco2e',
+        'attributed_client_workload_water_liters', 'attributed_ecoprint_overhead_water_liters',
+    ]) await _addColumnIfMissing(db, 'attribution_records', name, 'REAL');
+    for (const [name, type] of [
+        ['process_id', 'INTEGER'], ['parent_process_id', 'INTEGER'], ['executable_identity', 'TEXT'],
+        ['process_started_at', 'TEXT'], ['process_start_quality', 'TEXT'],
+        ['provenance_classification', "TEXT NOT NULL DEFAULT 'unknown'"],
+        ['provenance_source', "TEXT NOT NULL DEFAULT 'cli'"],
+        ['attribution_eligible', 'INTEGER NOT NULL DEFAULT 1'],
+    ]) await _addColumnIfMissing(db, 'context_events', name, type);
+    for (const [name, type] of [
+        ['client_workload_average_power_watts', 'REAL'], ['client_workload_peak_power_watts', 'REAL'],
+        ['client_workload_energy_wh', 'REAL'], ['client_workload_carbon_gco2e', 'REAL'], ['client_workload_water_liters', 'REAL'],
+        ['ecoprint_overhead_average_power_watts', 'REAL'], ['ecoprint_overhead_peak_power_watts', 'REAL'],
+        ['ecoprint_overhead_energy_wh', 'REAL'], ['ecoprint_overhead_carbon_gco2e', 'REAL'], ['ecoprint_overhead_water_liters', 'REAL'],
+        ['measurement_efficiency_pct', 'REAL'], ['measurement_method', "TEXT NOT NULL DEFAULT 'unknown'"],
+        ['allocation_method', "TEXT NOT NULL DEFAULT 'unavailable'"], ['provenance_quality', "TEXT NOT NULL DEFAULT 'unknown'"],
+        ['process_context_count', 'INTEGER NOT NULL DEFAULT 0'], ['process_lineage_coverage', 'REAL'],
+    ]) await _addColumnIfMissing(db, 'run_metrics', name, type);
+    for (const component of ['cpu', 'gpu', 'ane']) {
+        await _addColumnIfMissing(db, 'attribution_records', `attributed_${component}_power_watts`, 'REAL');
+        await _addColumnIfMissing(db, 'run_metrics', `${component}_average_power_watts`, 'REAL');
+        await _addColumnIfMissing(db, 'run_metrics', `${component}_peak_power_watts`, 'REAL');
+        await _addColumnIfMissing(db, 'run_metrics', `${component}_energy_wh`, 'REAL');
+    }
     await _addColumnIfMissing(db, 'run_metrics', 'grid_intensity_quality', "TEXT NOT NULL DEFAULT 'unknown'");
 }
 

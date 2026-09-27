@@ -67,6 +67,49 @@ export function closeSigSenseDb(db) {
     });
 }
 
+/** Normalize the existing SigSense component fields without changing its schema. */
+export function allocationBasisForSource(source, platform = process.platform) {
+    if (source === 'hardware' && platform === 'darwin') return 'macos-parser-time-allocation';
+    if (source === 'hardware') return 'unspecified-hardware-allocation';
+    if (source === 'hardware-rapl' || source === 'hardware-battery') return 'fixed-92-8-allocation';
+    if (source === 'estimated-pdh-proxy') return 'fixed-92-8-pdh-estimate';
+    if (source === 'estimated-simulator') return 'simulator-estimate';
+    if (source === 'fallback') return 'fallback-allocation';
+    return 'unavailable';
+}
+
+/** Normalize existing SigSense readings without changing its raw schema. */
+export function normalizeTelemetryRow(row, platform = process.platform) {
+    const hardwareComponentsAvailable = row.measurement_source === 'hardware';
+    const toWatts = field => {
+        const value = row[field];
+        return hardwareComponentsAvailable && value != null && Number.isFinite(Number(value))
+            ? Number(value) / 1000 : null;
+    };
+    return {
+        timestamp: row.timestamp,
+        resource_id: row.resource_id ?? null,
+        total_power_watts: row.total_power_watts ?? 0,
+        cpu_power_watts: toWatts('cpu_mw'),
+        gpu_power_watts: toWatts('gpu_mw'),
+        ane_power_watts: toWatts('ane_mw'),
+        client_workload_power_watts: finiteWatts(row.client_workload_watts),
+        ecoprint_overhead_power_watts: finiteWatts(row.ecoprint_overhead_watts),
+        carbon_gCO2e: row.carbon_gCO2e ?? 0,
+        water_liters: row.water_liters ?? 0,
+        interval_seconds: row.delta_time ?? 0,
+        measurement_source: row.measurement_source ?? 'unknown',
+        allocation_basis: allocationBasisForSource(row.measurement_source ?? 'unknown', platform),
+        split_provenance: row.client_workload_watts == null || row.ecoprint_overhead_watts == null
+            ? 'unavailable' : 'allocated',
+        grid_intensity_source: row.grid_intensity_source ?? 'unknown',
+    };
+}
+
+function finiteWatts(value) {
+    return value != null && Number.isFinite(Number(value)) ? Number(value) : null;
+}
+
 /**
  * Read telemetry rows within a time window and return normalized objects.
  *
@@ -115,7 +158,12 @@ export function readTelemetryWindow(db, { windowStart, windowEnd, resourceId }) 
             const sql = `
                 SELECT t.timestamp,
                        t.node_id AS resource_id,
+                       t.cpu_mw,
+                       t.gpu_mw,
+                       t.ane_mw,
                        t.total_power_watts,
+                       t.client_workload_watts,
+                       t.ecoprint_overhead_watts,
                        t.carbon_gCO2e,
                        t.water_liters,
                        t.delta_time,
@@ -128,16 +176,7 @@ export function readTelemetryWindow(db, { windowStart, windowEnd, resourceId }) 
             `;
             db.all(sql, params, (err, rows) => {
                 if (err) { reject(err); return; }
-                resolve(rows.map(r => ({
-                    timestamp:         r.timestamp,
-                    resource_id:       r.resource_id ?? null,
-                    total_power_watts: r.total_power_watts ?? 0,
-                    carbon_gCO2e:      r.carbon_gCO2e ?? 0,
-                    water_liters:      r.water_liters ?? 0,
-                    interval_seconds:  r.delta_time ?? 0,
-                    measurement_source: r.measurement_source ?? 'unknown',
-                    grid_intensity_source: r.grid_intensity_source ?? 'unknown',
-                })));
+                resolve(rows.map(row => normalizeTelemetryRow(row)));
             });
         });
     });

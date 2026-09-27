@@ -38,6 +38,8 @@ import { findBaseline, compareRunMetrics, saveRunMetrics } from './baseline.js';
 import { deriveInsights } from './insights.js';
 import { explainWithProvider } from './ai.js';
 import { prepareTelemetryRows } from './metrics.js';
+import { buildIdentityEnv, readIdentityEnv } from './env.js';
+import { createProcessProvenanceMonitor } from './process_provenance.js';
 import { sendIpcCommand }                      from './ipc.js';
 import { openSigSenseDb, closeSigSenseDb,
          readTelemetryWindow,
@@ -79,19 +81,28 @@ export async function runUnderTransparency(opts) {
         telemetryFn    = null,
         ipcFn          = sendIpcCommand,
         aiProvider     = null,
+        identityEnv    = process.env,
+        processMonitorFactory = createProcessProvenanceMonitor,
     } = opts;
+    const externalIdentity = readIdentityEnv(identityEnv);
 
     // ── 1. Open Transparency database ─────────────────────────────────────────
     const db = await openDatabase(transparencyDb);
     await initSchema(db);
 
     // ── 2. Identity ───────────────────────────────────────────────────────────
-    let workload = await dbGet(db,
-        `SELECT * FROM workloads WHERE name = ? AND type = ? AND status = 'active' ORDER BY created_at ASC LIMIT 1`,
-        [workloadName, workloadType]);
-    if (!workload) workload = await createWorkload(db, { name: workloadName, type: workloadType });
-    const run      = await startRun(db, { workloadId: workload.workload_id });
-    const attempt  = await startAttempt(db, { runId: run.run_id, workloadId: workload.workload_id });
+    let workload = externalIdentity.workloadId
+        ? await dbGet(db, 'SELECT * FROM workloads WHERE workload_id = ?', [externalIdentity.workloadId])
+        : await dbGet(db,
+            `SELECT * FROM workloads WHERE name = ? AND type = ? AND status = 'active' ORDER BY created_at ASC LIMIT 1`,
+            [workloadName, workloadType]);
+    if (!workload) workload = await createWorkload(db, {
+        name: workloadName, type: workloadType, workloadId: externalIdentity.workloadId ?? null,
+    });
+    const run = await startRun(db, { workloadId: workload.workload_id, runId: externalIdentity.runId ?? null });
+    const attempt = await startAttempt(db, {
+        runId: run.run_id, workloadId: workload.workload_id, attemptId: externalIdentity.attemptId ?? null,
+    });
 
     const resourceId = os.hostname();
 
@@ -109,11 +120,18 @@ export async function runUnderTransparency(opts) {
     }
 
     const startedAt = new Date().toISOString();
+    const provenanceMonitor = processMonitorFactory();
+    await provenanceMonitor.start().catch(() => {});
 
     const childResult = await new Promise((resolve) => {
         let child;
         try {
-            child = spawnFn(cmd, args, { stdio: 'inherit' });
+            child = spawnFn(cmd, args, {
+                stdio: 'inherit',
+                env: { ...process.env, ...buildIdentityEnv({
+                    workloadId: workload.workload_id, runId: run.run_id, attemptId: attempt.attempt_id,
+                }) },
+            });
         } catch (err) {
             resolve({ pid: null, code: 1, spawnError: err.message });
             return;
@@ -132,6 +150,9 @@ export async function runUnderTransparency(opts) {
 
     exitCode = childResult.code;
     const endedAt = new Date().toISOString();
+    const processContexts = await provenanceMonitor.stop({
+        clientPid: childPid, ecoprintPid: process.pid, windowStart: startedAt, windowEnd: endedAt,
+    }).catch(() => []);
     if (ipcStarted) {
         try {
             await ipcFn(`END ${run.run_id}`);
@@ -143,15 +164,56 @@ export async function runUnderTransparency(opts) {
     // ── 4. Record process context ─────────────────────────────────────────────
     // Insert context with exact start/end timestamps directly (bypass now())
     // so the window matches precisely what was measured.
+    const ecoprintContextId = await _insertContextDirect(db, {
+        workloadId: workload.workload_id,
+        runId: run.run_id,
+        attemptId: attempt.attempt_id,
+        externalId: String(process.pid),
+        processId: process.pid,
+        parentProcessId: process.ppid,
+        executableIdentity: path.basename(process.execPath),
+        processStartedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+        processStartQuality: 'process-api',
+        classification: 'ecoprint',
+        provenanceSource: 'cli-process-api',
+        attributionEligible: false,
+        resourceId,
+        startedAt,
+        endedAt,
+        parentContextId: null,
+    });
     const contextId = await _insertContextDirect(db, {
         workloadId: workload.workload_id,
         runId:      run.run_id,
         attemptId:  attempt.attempt_id,
         externalId: childPid !== null ? String(childPid) : 'unknown',
+        processId: childPid,
+        parentProcessId: process.pid,
+        executableIdentity: path.basename(cmd ?? 'unknown'),
+        processStartedAt: startedAt,
+        processStartQuality: 'spawn-observed',
+        classification: childPid === null ? 'unknown' : 'client',
+        provenanceSource: 'transparency-spawn',
+        attributionEligible: true,
         resourceId,
         startedAt,
         endedAt,
+        parentContextId: ecoprintContextId,
     });
+    const contextByPid = new Map([[process.pid, ecoprintContextId], [childPid, contextId]]);
+    for (const discovered of processContexts) {
+        const parentContextId = contextByPid.get(discovered.parentPid) ?? null;
+        const processContextId = await _insertContextDirect(db, {
+            workloadId: workload.workload_id, runId: run.run_id, attemptId: attempt.attempt_id,
+            externalId: String(discovered.pid), processId: discovered.pid,
+            parentProcessId: discovered.parentPid, executableIdentity: discovered.executable,
+            processStartedAt: discovered.processStartedAt, processStartQuality: discovered.processStartQuality,
+            classification: discovered.classification, provenanceSource: 'macos-ps-process-snapshot',
+            attributionEligible: false, resourceId, startedAt: discovered.startedAt,
+            endedAt: discovered.endedAt, parentContextId,
+        });
+        contextByPid.set(discovered.pid, processContextId);
+    }
 
     // ── 5. Complete identity lifecycle ────────────────────────────────────────
     const attemptStatus = exitCode === 0 ? 'completed' : 'failed';
@@ -245,6 +307,33 @@ export async function runUnderTransparency(opts) {
         energy_wh: reconciliation.measured.energy_wh,
         carbon_gco2e: reconciliation.measured.carbon_gco2e,
         water_liters: reconciliation.measured.water_liters,
+        cpu_average_power_watts: reconciliation.measured.cpu_power_watts,
+        cpu_peak_power_watts: reconciliation.measured.cpu_peak_power_watts,
+        cpu_energy_wh: reconciliation.measured.cpu_energy_wh,
+        gpu_average_power_watts: reconciliation.measured.gpu_power_watts,
+        gpu_peak_power_watts: reconciliation.measured.gpu_peak_power_watts,
+        gpu_energy_wh: reconciliation.measured.gpu_energy_wh,
+        ane_average_power_watts: reconciliation.measured.ane_power_watts,
+        ane_peak_power_watts: reconciliation.measured.ane_peak_power_watts,
+        ane_energy_wh: reconciliation.measured.ane_energy_wh,
+        client_workload_average_power_watts: reconciliation.measured.client_workload_power_watts,
+        client_workload_peak_power_watts: reconciliation.measured.client_workload_peak_power_watts,
+        client_workload_energy_wh: reconciliation.measured.client_workload_energy_wh,
+        client_workload_carbon_gco2e: reconciliation.measured.client_workload_carbon_gco2e,
+        client_workload_water_liters: reconciliation.measured.client_workload_water_liters,
+        ecoprint_overhead_average_power_watts: reconciliation.measured.ecoprint_overhead_power_watts,
+        ecoprint_overhead_peak_power_watts: reconciliation.measured.ecoprint_overhead_peak_power_watts,
+        ecoprint_overhead_energy_wh: reconciliation.measured.ecoprint_overhead_energy_wh,
+        ecoprint_overhead_carbon_gco2e: reconciliation.measured.ecoprint_overhead_carbon_gco2e,
+        ecoprint_overhead_water_liters: reconciliation.measured.ecoprint_overhead_water_liters,
+        measurement_efficiency_pct: measurementEfficiency(reconciliation.measured),
+        measurement_method: [...new Set(telemetryRows.map(row => row.measurement_source ?? 'unknown'))].sort().join('+') || 'unavailable',
+        allocation_method: [...new Set(telemetryRows.map(row => row.allocation_basis ?? 'unavailable'))].sort().join('+') || 'unavailable',
+        provenance_quality: provenanceQuality(telemetryRows),
+        process_context_count: processContexts.length + 2,
+        process_lineage_coverage: processLineageCoverage(processContexts, childPid),
+        component_telemetry_counts: Object.fromEntries(['cpu', 'gpu', 'ane'].map(component =>
+            [component, telemetryRows.filter(row => row[`${component}_power_watts`] != null).length])),
         attribution_coverage: attributionCoverage,
         measurement_quality: measurementQuality,
         grid_intensity_quality: gridIntensityQuality,
@@ -262,9 +351,51 @@ export async function runUnderTransparency(opts) {
         currentMetrics: runMetrics,
         telemetryCount: telemetryRows.length,
         resourceId,
+        processContexts,
+        workload,
+        run,
+        attempt,
     });
+    const aiFacts = {
+        identity: {
+            workload: { workload_id: workload.workload_id, name: workload.name, identity_source: workload.identity_source },
+            run: { run_id: run.run_id, identity_source: run.identity_source },
+            attempt: { attempt_id: attempt.attempt_id, attempt_no: attempt.attempt_no, identity_source: attempt.identity_source },
+        },
+        process_lineage: [
+            { pid: process.pid, parent_pid: process.ppid, executable: path.basename(process.execPath), classification: 'ecoprint' },
+            { pid: childPid, parent_pid: process.pid, executable: path.basename(cmd ?? 'unknown'), classification: childPid == null ? 'unknown' : 'client' },
+            ...processContexts.map(({ pid, parentPid, executable, classification, startedAt: processStart, endedAt: processEnd }) => ({
+                pid, parent_pid: parentPid, executable, classification, started_at: processStart, ended_at: processEnd,
+            })),
+        ],
+        measurement: runMetrics,
+        self_measurement: {
+            client_workload: {
+                energy_wh: runMetrics.client_workload_energy_wh,
+                carbon_gco2e: runMetrics.client_workload_carbon_gco2e,
+                water_liters: runMetrics.client_workload_water_liters,
+            },
+            ecoprint_overhead: {
+                energy_wh: runMetrics.ecoprint_overhead_energy_wh,
+                carbon_gco2e: runMetrics.ecoprint_overhead_carbon_gco2e,
+                water_liters: runMetrics.ecoprint_overhead_water_liters,
+            },
+            efficiency_pct: runMetrics.measurement_efficiency_pct,
+            method: runMetrics.measurement_method,
+            allocation_method: runMetrics.allocation_method,
+            provenance_quality: runMetrics.provenance_quality,
+        },
+        attribution: {
+            coverage: runMetrics.attribution_coverage,
+            version: reconciliation.attribution_version,
+            reconciliation,
+        },
+        baseline: baselineComparison,
+        system_context: { other_process_details: 'not collected; process arguments and unrelated process identities are not persisted' },
+    };
     const aiExplanation = aiProvider
-        ? await explainWithProvider({ facts: runMetrics, insights, provider: aiProvider })
+        ? await explainWithProvider({ facts: aiFacts, insights, provider: aiProvider })
         : null;
 
     // ── 10. Close Transparency DB ─────────────────────────────────────────────
@@ -276,6 +407,9 @@ export async function runUnderTransparency(opts) {
         run:     completedRun,
         attempt: completedAttempt,
         contextId,
+        ecoprintContextId,
+        processContexts,
+        aiFacts,
 
         // Execution
         command,
@@ -313,7 +447,11 @@ export async function runUnderTransparency(opts) {
  */
 async function _insertContextDirect(db, { workloadId, runId, attemptId,
                                           externalId, resourceId,
-                                          startedAt, endedAt }) {
+                                          startedAt, endedAt, processId = null,
+                                          parentProcessId = null, executableIdentity = null,
+                                          processStartedAt = null, processStartQuality = null,
+                                          classification = 'unknown', provenanceSource = 'transparency-cli',
+        attributionEligible = true, parentContextId = null }) {
     const { randomUUID } = await import('node:crypto');
     const context_id = randomUUID();
 
@@ -321,11 +459,37 @@ async function _insertContextDirect(db, { workloadId, runId, attemptId,
         `INSERT INTO context_events
              (context_id, workload_id, run_id, attempt_id,
               context_type, external_id, resource_id,
-              started_at, ended_at, source, parent_context_id)
-         VALUES (?,?,?,?, 'process',?,?, ?,?,?,NULL)`,
+              started_at, ended_at, source, parent_context_id, process_id, parent_process_id,
+              executable_identity, process_started_at, process_start_quality,
+              provenance_classification, provenance_source, attribution_eligible)
+         VALUES (?,?,?,?, 'process',?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [context_id, workloadId, runId, attemptId,
          externalId, resourceId ?? null,
-         startedAt, endedAt, 'transparency-cli']
+         startedAt, endedAt, provenanceSource, parentContextId, processId, parentProcessId,
+         executableIdentity, processStartedAt, processStartQuality, classification,
+         provenanceSource, attributionEligible ? 1 : 0]
     );
     return context_id;
+}
+
+function measurementEfficiency(metrics) {
+    const client = metrics.client_workload_energy_wh;
+    const overhead = metrics.ecoprint_overhead_energy_wh;
+    const total = client == null || overhead == null ? null : client + overhead;
+    return total > 0 ? client / total * 100 : null;
+}
+
+function provenanceQuality(rows) {
+    if (!rows.length) return 'unavailable';
+    const available = rows.filter(row => row.split_provenance === 'allocated').length;
+    if (!available) return 'unavailable';
+    if (available !== rows.length) return 'partial';
+    return rows.every(row => (row.measurement_source ?? '').startsWith('hardware'))
+        ? 'hardware-total-with-allocated-split' : 'estimated-total-with-allocated-split';
+}
+
+function processLineageCoverage(rows, clientPid) {
+    if (!clientPid) return null;
+    const linkable = rows.filter(row => row.parentPid != null).length;
+    return (linkable + 1) / (rows.length + 1) * 100;
 }

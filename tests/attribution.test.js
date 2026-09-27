@@ -33,6 +33,7 @@ import {
     reconcileAttribution,
 } from '../src/transparency/index.js';
 import { dbRun } from '../src/transparency/db.js';
+import { dbAll } from '../src/transparency/db.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -55,28 +56,41 @@ async function scaffoldAttempt(db, { workloadName = 'test-wl', workloadType = 'c
  */
 async function insertCtx(db, { contextId, workloadId, runId, attemptId,
                                 externalId, resourceId, startedAt, endedAt,
-                                source = 'transparency-launch' }) {
+                                source = 'transparency-launch', attributionEligible = true,
+                                processId = null, parentProcessId = null, classification = 'unknown' }) {
     await dbRun(db,
         `INSERT INTO context_events
              (context_id, workload_id, run_id, attempt_id,
               context_type, external_id, resource_id,
-              started_at, ended_at, source, parent_context_id)
-         VALUES (?,?,?,?, 'process',?,?, ?,?,?,NULL)`,
+              started_at, ended_at, source, parent_context_id, attribution_eligible,
+              process_id, parent_process_id, provenance_classification)
+         VALUES (?,?,?,?, 'process',?,?, ?,?,?,NULL,?,?,?,?)`,
         [contextId, workloadId, runId, attemptId,
          externalId, resourceId ?? null,
-         startedAt, endedAt ?? null, source]
+         startedAt, endedAt ?? null, source, attributionEligible ? 1 : 0,
+         processId, parentProcessId, classification]
     );
 }
 
 /** Build a minimal telemetry row for attribution. */
-function tRow(timestamp, { resourceId = null, power = 1.0, carbon = 0.001, water = 0.0001 } = {}) {
+function tRow(timestamp, { resourceId = null, power = 1.0, carbon = 0.001, water = 0.0001,
+    cpu = null, gpu = null, ane = null } = {}) {
     return {
         timestamp,
         resource_id:        resourceId,
         total_power_watts:  power,
+        cpu_power_watts: cpu,
+        gpu_power_watts: gpu,
+        ane_power_watts: ane,
         carbon_gCO2e:       carbon,
         water_liters:       water,
         interval_seconds:   1,
+        client_workload_power_watts: power * 0.8,
+        ecoprint_overhead_power_watts: power * 0.2,
+        client_workload_carbon_gCO2e: carbon * 0.8,
+        ecoprint_overhead_carbon_gCO2e: carbon * 0.2,
+        client_workload_water_liters: water * 0.8,
+        ecoprint_overhead_water_liters: water * 0.2,
     };
 }
 
@@ -769,6 +783,69 @@ describe('Transparency Deterministic Attribution', () => {
             const recs = await getAttemptAttribution(db, att2.attempt_id);
             assert.ok(recs.length > 0);
             for (const r of recs) assert.equal(r.attempt_id, att2.attempt_id);
+        });
+    });
+
+    describe('component attribution and reconciliation', () => {
+        let db;
+        after(async () => { if (db) await closeDatabase(db); });
+
+        it('attributes each available component and reconciles component energy independently', async () => {
+            db = await freshDb();
+            const { workload, run, attempt } = await scaffoldAttempt(db, { workloadName: 'components' });
+            await insertCtx(db, {
+                contextId: 'ctx-components', workloadId: workload.workload_id,
+                runId: run.run_id, attemptId: attempt.attempt_id, externalId: 'comp-1',
+                resourceId: 'host-components', startedAt: T.s0, endedAt: T.e2, processId: 111,
+            });
+            await insertCtx(db, {
+                contextId: 'ctx-lineage-worker', workloadId: workload.workload_id,
+                runId: run.run_id, attemptId: attempt.attempt_id, externalId: 'comp-child',
+                resourceId: 'host-components', startedAt: T.s0, endedAt: T.e2,
+                attributionEligible: false, processId: 222, parentProcessId: 111,
+                classification: 'child-of-client',
+            });
+            const telemetry = [
+                tRow(T.t1, { resourceId: 'host-components', power: 3, cpu: 1.2, gpu: 0.5, ane: 0.1 }),
+                tRow(T.t3, { resourceId: 'host-components', power: 2, cpu: 0.8, gpu: 0.2, ane: null }),
+            ].map(row => ({ ...row, interval_seconds: 2 }));
+            telemetry[0].process_id = 222;
+            const records = await attributeTelemetryWindow(db, {
+                telemetry, windowStart: T.t1, windowEnd: T.t3,
+            });
+            const storedSplits = await dbAll(db, 'SELECT attributed_client_workload_carbon_gco2e, attributed_ecoprint_overhead_carbon_gco2e FROM attribution_records ORDER BY telemetry_timestamp');
+            assert.equal(storedSplits[0].attributed_client_workload_carbon_gco2e, 0.0008);
+            assert.equal(records[0].attributed_cpu_power_watts, 1.2);
+            assert.equal(records[0].attributed_gpu_power_watts, 0.5);
+            assert.equal(records[0].attributed_ane_power_watts, 0.1);
+            assert.ok(Math.abs(records[0].attributed_client_workload_power_watts - 2.4) < 1e-12);
+            assert.ok(Math.abs(records[0].attributed_client_workload_carbon_gco2e - 0.0008) < 1e-12);
+            assert.equal(records[0].evidence_level, 'exact', 'provenance-only contexts do not dilute system telemetry');
+            assert.equal(records[0].attribution_method, 'parent-lineage-match');
+            assert.equal(records[1].attributed_ane_power_watts, null);
+
+            const report = await reconcileAttribution(db, {
+                telemetry, windowStart: T.t1, windowEnd: T.t3,
+            });
+            for (const component of ['cpu', 'gpu', 'ane']) {
+                const energy = `${component}_energy_wh`;
+                const power = `${component}_power_watts`;
+                assert.ok(Math.abs(report.measured[energy] - report.attributed[energy] - report.unattributed[energy]) < 1e-12);
+                assert.ok(Math.abs(report.measured[power] - report.attributed[power] - report.unattributed[power]) < 1e-12);
+            }
+            for (const component of ['client_workload', 'ecoprint_overhead']) {
+                assert.ok(Math.abs(report.measured[`${component}_energy_wh`] - report.attributed[`${component}_energy_wh`] - report.unattributed[`${component}_energy_wh`]) < 1e-12,
+                    `${component} energy: ${JSON.stringify([report.measured[`${component}_energy_wh`], report.attributed[`${component}_energy_wh`], report.unattributed[`${component}_energy_wh`]])}`);
+                assert.ok(Math.abs(report.measured[`${component}_power_watts`] - report.attributed[`${component}_power_watts`] - report.unattributed[`${component}_power_watts`]) < 1e-12);
+                assert.ok(Math.abs(report.measured[`${component}_carbon_gco2e`] - report.attributed[`${component}_carbon_gco2e`] - report.unattributed[`${component}_carbon_gco2e`]) < 1e-12,
+                    `${component} carbon: ${JSON.stringify([report.measured[`${component}_carbon_gco2e`], report.attributed[`${component}_carbon_gco2e`], report.unattributed[`${component}_carbon_gco2e`]])}`);
+                assert.ok(Math.abs(report.measured[`${component}_water_liters`] - report.attributed[`${component}_water_liters`] - report.unattributed[`${component}_water_liters`]) < 1e-12);
+            }
+            assert.ok(Math.abs(report.attributed.cpu_energy_wh - 2.4 / 3600) < 1e-12);
+            assert.ok(Math.abs(report.unattributed.cpu_energy_wh - 1.6 / 3600) < 1e-12);
+            assert.equal(report.measured.ane_duration_seconds, 2);
+            assert.equal(report.unattributed.ane_energy_wh, 0);
+            assert.equal(report.measured.energy_wh, 10 / 3600, 'total energy still uses total power only');
         });
     });
 

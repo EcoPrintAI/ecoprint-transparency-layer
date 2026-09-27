@@ -48,6 +48,80 @@ describe('time-aware telemetry metrics', () => {
             energy_kwh: 0,
             carbon_gco2e: 0,
             water_liters: 0,
+            cpu_power_watts: null, cpu_peak_power_watts: null, cpu_energy_wh: null,
+            cpu_energy_kwh: null, cpu_duration_seconds: null, cpu_telemetry_count: 0,
+            gpu_power_watts: null, gpu_peak_power_watts: null, gpu_energy_wh: null,
+            gpu_energy_kwh: null, gpu_duration_seconds: null, gpu_telemetry_count: 0,
+            ane_power_watts: null, ane_peak_power_watts: null, ane_energy_wh: null,
+            ane_energy_kwh: null, ane_duration_seconds: null, ane_telemetry_count: 0,
+            client_workload_power_watts: null, client_workload_peak_power_watts: null,
+            client_workload_energy_wh: null, client_workload_energy_kwh: null,
+            client_workload_duration_seconds: null,
+            client_workload_carbon_gco2e: null, client_workload_water_liters: null,
+            client_workload_telemetry_count: 0, client_workload_environmental_allocation: 'unavailable',
+            ecoprint_overhead_power_watts: null, ecoprint_overhead_peak_power_watts: null,
+            ecoprint_overhead_energy_wh: null, ecoprint_overhead_energy_kwh: null,
+            ecoprint_overhead_duration_seconds: null,
+            ecoprint_overhead_carbon_gco2e: null, ecoprint_overhead_water_liters: null,
+            ecoprint_overhead_telemetry_count: 0, ecoprint_overhead_environmental_allocation: 'unavailable',
         });
+    });
+
+    it('integrates CPU, GPU, and ANE average, peak, and energy independently', () => {
+        const summary = summarizeTelemetry([
+            { interval_seconds: 1, total_power_watts: 10, cpu_power_watts: 2, gpu_power_watts: 1, ane_power_watts: 0.5 },
+            { interval_seconds: 3, total_power_watts: 30, cpu_power_watts: 4, gpu_power_watts: 2, ane_power_watts: 1.5 },
+        ]);
+        assert.ok(Math.abs(summary.cpu_power_watts - 3.5) < 1e-12);
+        assert.equal(summary.cpu_peak_power_watts, 4);
+        assert.ok(Math.abs(summary.cpu_energy_wh - 14 / 3600) < 1e-12);
+        assert.ok(Math.abs(summary.gpu_power_watts - 1.75) < 1e-12);
+        assert.equal(summary.gpu_peak_power_watts, 2);
+        assert.ok(Math.abs(summary.gpu_energy_wh - 7 / 3600) < 1e-12);
+        assert.ok(Math.abs(summary.ane_power_watts - 1.25) < 1e-12);
+        assert.equal(summary.ane_peak_power_watts, 1.5);
+        assert.ok(Math.abs(summary.ane_energy_wh - 5 / 3600) < 1e-12);
+        assert.ok(Math.abs(summary.energy_wh - 100 / 3600) < 1e-12,
+            'total energy is integrated only from total power');
+    });
+
+    it('uses only intervals with available component data and reports wholly absent components unavailable', () => {
+        const summary = summarizeTelemetry([
+            { interval_seconds: 2, total_power_watts: 10, cpu_power_watts: 2, gpu_power_watts: null },
+            { interval_seconds: 1, total_power_watts: 20, cpu_power_watts: null, gpu_power_watts: null },
+        ]);
+        assert.equal(summary.cpu_power_watts, 2);
+        assert.equal(summary.cpu_duration_seconds, 2);
+        assert.equal(summary.cpu_telemetry_count, 1);
+        assert.equal(summary.gpu_power_watts, null);
+        assert.equal(summary.gpu_energy_wh, null);
+    });
+
+    it('integrates client and EcoPrint allocation series and proportionally reconciles environment values', () => {
+        const metrics = summarizeTelemetry([
+            { interval_seconds: 2, total_power_watts: 10, client_workload_power_watts: 8,
+                ecoprint_overhead_power_watts: 2, carbon_gCO2e: 0.1, water_liters: 0.02 },
+        ]);
+        assert.equal(metrics.client_workload_power_watts, 8);
+        assert.equal(metrics.client_workload_peak_power_watts, 8);
+        assert.equal(metrics.ecoprint_overhead_power_watts, 2);
+        assert.equal(metrics.ecoprint_overhead_peak_power_watts, 2);
+        assert.ok(Math.abs(metrics.client_workload_energy_wh - 16 / 3600) < 1e-12);
+        assert.ok(Math.abs(metrics.ecoprint_overhead_energy_wh - 4 / 3600) < 1e-12);
+        assert.ok(Math.abs(metrics.client_workload_carbon_gco2e - 0.08) < 1e-12);
+        assert.ok(Math.abs(metrics.ecoprint_overhead_water_liters - 0.004) < 1e-12);
+        assert.equal(metrics.client_workload_environmental_allocation, 'proportional-to-power');
+    });
+
+    it('does not report allocated environmental values when a split is missing or fails reconciliation', () => {
+        const metrics = summarizeTelemetry([
+            { interval_seconds: 1, total_power_watts: 10, client_workload_power_watts: 7,
+                ecoprint_overhead_power_watts: 1, carbon_gCO2e: 0.2, water_liters: 0.1 },
+            { interval_seconds: 1, total_power_watts: 10, client_workload_power_watts: null,
+                ecoprint_overhead_power_watts: null, carbon_gCO2e: 0.2, water_liters: 0.1 },
+        ]);
+        assert.equal(metrics.client_workload_energy_wh, 7 / 3600);
+        assert.equal(metrics.client_workload_carbon_gco2e, null);
+        assert.equal(metrics.ecoprint_overhead_water_liters, null);
     });
 });

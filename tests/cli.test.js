@@ -88,12 +88,92 @@ async function runCli(overrides = {}) {
                 .map(row => row.timestamp?.startsWith('2099-') ? { ...row, timestamp: end } : row)
             : fakeTelemetry([]),
         ipcFn:          overrides.ipcFn          ?? (async () => 'OK COLLECTING'),
+        processMonitorFactory: overrides.processMonitorFactory ?? (() => ({ start: async () => {}, stop: async () => [] })),
+        identityEnv: overrides.identityEnv,
+        aiProvider: overrides.aiProvider,
     });
 }
 
 // ── Test suites ───────────────────────────────────────────────────────────────
 
 describe('EcoPrint Transparency CLI', () => {
+
+    it('uses orchestrator identity, persists process provenance, and exposes full self-measurement facts to an AI adapter', async () => {
+        const directory = await mkdtemp(path.join(tmpdir(), 'ecoprint-provenance-'));
+        const dbPath = path.join(directory, 'transparency.db');
+        let childEnv;
+        let aiFacts;
+        try {
+            const result = await runCli({
+                workloadName: 'orchestrated-build',
+                transparencyDb: dbPath,
+                identityEnv: {
+                    ECOPRINT_WORKLOAD_ID: 'orch-workload',
+                    ECOPRINT_RUN_ID: 'orch-run',
+                    ECOPRINT_ATTEMPT_ID: 'orch-attempt',
+                },
+                spawnFn: (cmd, args, options) => {
+                    childEnv = options.env;
+                    return fakeSpawn({ pid: 9101 })(cmd, args, options);
+                },
+                processMonitorFactory: () => ({
+                    start: async () => {},
+                    stop: async () => [{ pid: 9102, parentPid: 9101, executable: 'worker',
+                        processStartedAt: '2099-06-01T00:00:00.000Z', processStartQuality: 'estimated-seconds',
+                        classification: 'child-of-client', startedAt: '2099-06-01T00:00:00.000Z',
+                        endedAt: '2099-06-01T00:00:01.000Z' }],
+                }),
+                telemetryFn: (start, end, resource) => [{
+                    ...tRow(end, 10, 0.1, 0.02), resource_id: resource,
+                    client_workload_power_watts: 8, ecoprint_overhead_power_watts: 2,
+                    measurement_source: 'hardware', allocation_basis: 'macos-parser-time-allocation',
+                    split_provenance: 'allocated',
+                }],
+                aiProvider: { explain: async ({ facts }) => { aiFacts = facts; return 'Uses supplied facts only.'; } },
+            });
+            assert.equal(result.workload.workload_id, 'orch-workload');
+            assert.equal(result.run.run_id, 'orch-run');
+            assert.equal(result.attempt.attempt_id, 'orch-attempt');
+            assert.equal(childEnv.ECOPRINT_WORKLOAD_ID, 'orch-workload');
+            assert.equal(result.processContexts.length, 1);
+            assert.equal(result.runMetrics.client_workload_average_power_watts, 8);
+            assert.equal(result.runMetrics.ecoprint_overhead_average_power_watts, 2);
+            assert.equal(result.runMetrics.measurement_efficiency_pct, 80);
+            assert.equal(result.runMetrics.provenance_quality, 'hardware-total-with-allocated-split');
+            assert.equal(aiFacts.process_lineage.some(item => item.classification === 'child-of-client'), true);
+            assert.equal(aiFacts.self_measurement.allocation_method, 'macos-parser-time-allocation');
+            assert.equal(result.aiExplanation, 'Uses supplied facts only.');
+
+            const persisted = await openDatabase(dbPath);
+            try {
+                const contexts = await new Promise((resolve, reject) => persisted.all(
+                    'SELECT process_id, parent_process_id, executable_identity, provenance_classification, attribution_eligible FROM context_events ORDER BY started_at',
+                    (error, rows) => error ? reject(error) : resolve(rows)));
+                const eco = contexts.find(row => row.provenance_classification === 'ecoprint');
+                const child = contexts.find(row => row.pid === 9102 || row.process_id === 9102);
+                assert.ok(eco);
+                assert.equal(child?.provenance_classification, 'child-of-client');
+                assert.equal(child?.attribution_eligible, 0);
+            } finally {
+                await closeDatabase(persisted);
+            }
+        } finally {
+            await rm(directory, { recursive: true, force: true });
+        }
+    });
+
+    it('reports measurement efficiency as unavailable when allocated energy is zero', async () => {
+        const result = await runCli({
+            telemetryFn: async (_start, end, resource) => [{
+                timestamp: end, resource_id: resource, total_power_watts: 0,
+                client_workload_power_watts: 0, ecoprint_overhead_power_watts: 0,
+                carbon_gCO2e: 0, water_liters: 0, interval_seconds: 1,
+                measurement_source: 'fallback', allocation_basis: 'fallback-allocation', split_provenance: 'allocated',
+            }],
+        });
+        assert.equal(result.runMetrics.measurement_efficiency_pct, null);
+        assert.equal(result.runMetrics.provenance_quality, 'estimated-total-with-allocated-split');
+    });
 
     it('compares the actual baseline measurement sources in deterministic insights', async () => {
         const directory = await mkdtemp(path.join(tmpdir(), 'ecoprint-cli-baseline-'));
