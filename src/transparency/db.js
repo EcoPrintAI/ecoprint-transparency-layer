@@ -202,6 +202,28 @@ export async function initSchema(db) {
             process_lineage_coverage REAL,
             created_at              TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS experience_cases (
+            experience_id             TEXT PRIMARY KEY,
+            run_id                    TEXT NOT NULL UNIQUE REFERENCES runs(run_id),
+            workload_id               TEXT NOT NULL REFERENCES workloads(workload_id),
+            workload_name             TEXT NOT NULL,
+            workload_type             TEXT NOT NULL,
+            measured_facts_json       TEXT NOT NULL,
+            derived_facts_json        TEXT NOT NULL,
+            provenance_json           TEXT NOT NULL,
+            ai_interpretation_json    TEXT,
+            ai_usage_json             TEXT,
+            interpretation_status    TEXT NOT NULL DEFAULT 'none'
+                                      CHECK (interpretation_status IN ('none', 'unverified', 'low-confidence')),
+            interpretation_confidence REAL,
+            outcome_json              TEXT,
+            outcome_status            TEXT NOT NULL DEFAULT 'none'
+                                      CHECK (outcome_status IN ('none', 'unverified', 'verified')),
+            created_at                TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_experience_workload_type ON experience_cases(workload_type);
+        CREATE INDEX IF NOT EXISTS idx_experience_created_at ON experience_cases(created_at);
     `;
 
     await new Promise((resolve, reject) => {
@@ -246,6 +268,7 @@ export async function initSchema(db) {
         await _addColumnIfMissing(db, 'run_metrics', `${component}_energy_wh`, 'REAL');
     }
     await _addColumnIfMissing(db, 'run_metrics', 'grid_intensity_quality', "TEXT NOT NULL DEFAULT 'unknown'");
+    await _addColumnIfMissing(db, 'experience_cases', 'ai_usage_json', 'TEXT');
 }
 
 /**

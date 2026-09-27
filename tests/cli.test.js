@@ -22,6 +22,7 @@ import path from 'node:path';
 
 import { runUnderTransparency }   from '../src/transparency/cli.js';
 import { openDatabase, initSchema, closeDatabase } from '../src/transparency/index.js';
+import { formatReport } from '../src/transparency/report.js';
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
@@ -140,8 +141,8 @@ describe('EcoPrint Transparency CLI', () => {
             assert.equal(result.runMetrics.ecoprint_overhead_average_power_watts, 2);
             assert.equal(result.runMetrics.measurement_efficiency_pct, 80);
             assert.equal(result.runMetrics.provenance_quality, 'hardware-total-with-allocated-split');
-            assert.equal(aiFacts.process_lineage.some(item => item.classification === 'child-of-client'), true);
-            assert.equal(aiFacts.self_measurement.allocation_method, 'macos-parser-time-allocation');
+            assert.equal(aiFacts.current_run_facts.process_lineage.some(item => item.classification === 'child-of-client'), true);
+            assert.equal(aiFacts.current_run_facts.self_measurement.allocation_method, 'macos-parser-time-allocation');
             assert.equal(result.aiExplanation, 'Uses supplied facts only.');
 
             const persisted = await openDatabase(dbPath);
@@ -612,6 +613,200 @@ describe('EcoPrint Transparency CLI', () => {
             assert.ok(result.telemetryRows[0].interval_seconds <= result.runMetrics.duration_ms / 1000);
             assert.ok(result.runMetrics.energy_wh > 0, 'only the measured overlap contributes energy');
             assert.equal(result.runMetrics.measurement_method, 'hardware');
+        });
+    });
+
+    describe('optional AI interpretation and case memory', () => {
+        it('keeps a no-AI run deterministic and saves its eligible evidence case', async () => {
+            const directory = await mkdtemp(path.join(tmpdir(), 'ecoprint-no-ai-'));
+            const dbPath = path.join(directory, 'transparency.db');
+            try {
+                const result = await runCli({
+                    transparencyDb: dbPath,
+                    telemetryFn: async (_start, end, resource) => [{
+                        ...tRow(end, 12, 0.01, 0.001), resource_id: resource,
+                        measurement_source: 'hardware',
+                    }],
+                });
+                assert.equal(result.aiExplanation, null);
+                assert.equal(result.aiError, null);
+                assert.equal(result.aiUsage, null);
+                assert.doesNotMatch(formatReport(result), /AI USAGE|Tokens:/);
+                assert.ok(Math.abs(result.runMetrics.average_power_watts - 12) < 1e-9);
+                const db = await openDatabase(dbPath);
+                try {
+                    const cases = await new Promise((resolve, reject) => db.all(
+                        'SELECT measured_facts_json, derived_facts_json, ai_usage_json FROM experience_cases WHERE run_id = ?',
+                        [result.run.run_id], (error, rows) => error ? reject(error) : resolve(rows)));
+                    assert.equal(cases.length, 1);
+                    assert.equal(JSON.parse(cases[0].measured_facts_json).telemetry_observations[0].total_power_watts, 12);
+                    assert.ok(Math.abs(JSON.parse(cases[0].derived_facts_json).metrics.average_power_watts - 12) < 1e-9);
+                    assert.equal(cases[0].ai_usage_json, null);
+                } finally {
+                    await closeDatabase(db);
+                }
+            } finally {
+                await rm(directory, { recursive: true, force: true });
+            }
+        });
+
+        it('passes similar historical cases to AI and places the explanation after deterministic insights', async () => {
+            const directory = await mkdtemp(path.join(tmpdir(), 'ecoprint-ai-memory-'));
+            const dbPath = path.join(directory, 'transparency.db');
+            const observations = [];
+            const aiProvider = {
+                name: 'fake-provider', model: 'fake-model', usageMetadata: null,
+                async explain(args) {
+                    observations.push(args.facts);
+                    this.usageMetadata = {
+                        provider: 'fake-provider', model: 'fake-model', input_tokens: 100, output_tokens: 20,
+                        total_tokens: 120, inference_latency_ms: null, local_request_latency_ms: 10, request_id: null,
+                    };
+                    return 'The current CPU average is 12 W; investigate the build steps associated with the observed increase.';
+                },
+            };
+            const telemetryFn = async (_start, end, resource) => [{
+                ...tRow(end, 12, 0.01, 0.001), resource_id: resource,
+                cpu_power_watts: 8, gpu_power_watts: 4, ane_power_watts: 0,
+                measurement_source: 'hardware',
+            }];
+            try {
+                const first = await runCli({ workloadName: 'repeatable-build', transparencyDb: dbPath, telemetryFn, aiProvider });
+                const second = await runCli({ workloadName: 'repeatable-build', transparencyDb: dbPath, telemetryFn, aiProvider });
+                assert.equal(observations[0].historical_experience_not_current_measurements.status, 'novel-pattern-no-prior-cases');
+                assert.equal(first.aiExplanation.startsWith('The current CPU'), true,
+                    'no matching historical case still permits current-run AI interpretation');
+                assert.equal(observations[1].historical_experience_not_current_measurements.cases.length, 1);
+                assert.equal(observations[1].historical_experience_not_current_measurements.cases[0].historical_ai_interpretation.status, 'unverified');
+                assert.equal(observations[1].historical_experience_not_current_measurements.cases[0].ai_usage.signal_type, 'logical_ai_usage');
+                assert.equal(observations[1].historical_experience_not_current_measurements.cases[0].ai_usage.input_tokens, 100);
+                assert.ok(Math.abs(observations[1].current_run_facts.measurement.average_power_watts - 12) < 1e-9);
+                assert.ok(Math.abs(second.runMetrics.average_power_watts - 12) < 1e-9,
+                    'AI output cannot replace deterministic metrics');
+                const report = formatReport(second);
+                assert.ok(report.indexOf('DETERMINISTIC INSIGHTS') < report.indexOf('AI INTERPRETATION'));
+                assert.ok(report.indexOf('AI INTERPRETATION') < report.indexOf('AI USAGE'));
+                assert.match(report, /The current CPU average is 12 W/);
+                assert.match(report, /Prior cases: 1/);
+                const markdownReport = formatReport({ ...second, aiExplanation: '## Summary\n- **Measured** `fact`' });
+                assert.match(markdownReport, /SUMMARY\n  • Measured fact/);
+                assert.doesNotMatch(markdownReport, /##|`|\*\*/);
+                assert.ok(Math.abs(first.runMetrics.average_power_watts - 12) < 1e-9);
+            } finally {
+                await rm(directory, { recursive: true, force: true });
+            }
+        });
+
+        it('withholds a historical-data hallucination for a no-telemetry current run', async () => {
+            const directory = await mkdtemp(path.join(tmpdir(), 'ecoprint-ai-grounding-'));
+            const dbPath = path.join(directory, 'transparency.db');
+            let receivedFacts;
+            const aiProvider = {
+                name: 'ollama', model: 'llama3.2:3b', usageMetadata: null,
+                async explain({ facts }) {
+                    receivedFacts = facts;
+                    this.usageMetadata = {
+                        provider: 'ollama', model: 'llama3.2:3b', input_tokens: 10, output_tokens: 4,
+                        total_tokens: 14, inference_latency_ms: 2, local_request_latency_ms: 3,
+                    };
+                    const duration = facts.current_run_facts.measurement.duration_ms;
+                    return `Current run completed in ${duration + 1000} ms. Current CPU rose to 8 W and energy increased to 0.02 Wh. Input tokens 999.`;
+                },
+            };
+            try {
+                const previous = await runCli({
+                    workloadName: 'grounded-repeatable-build', transparencyDb: dbPath,
+                    telemetryFn: async (_start, end, resource) => [{
+                        ...tRow(end, 12, 0.01, 0.001), resource_id: resource, measurement_source: 'hardware',
+                    }],
+                });
+                const result = await runCli({
+                    workloadName: 'grounded-repeatable-build', transparencyDb: dbPath,
+                    aiProvider, telemetryFn: async () => [],
+                });
+                assert.ok(receivedFacts.historical_experience_not_current_measurements.cases.some(
+                    item => item.run_id === previous.run.run_id));
+                const current = receivedFacts.current_run_facts;
+                assert.equal(current.telemetry_observation_count, 0);
+                assert.equal(current.measurement.duration_ms, result.durationMs);
+                assert.equal(current.measurement.average_power_watts, null);
+                assert.equal(current.measurement.cpu_average_power_watts, null);
+                assert.equal(current.measurement.energy_wh, null);
+                assert.equal(current.measurement.carbon_gco2e, null);
+                assert.equal(current.measurement.water_liters, null);
+                assert.equal(current.baseline.metrics.energy_wh.absolute_delta, null);
+                assert.equal(result.aiExplanation, null);
+                assert.match(result.aiGroundingError, /physical measurement claim/);
+                assert.equal(result.aiUsage.input_tokens, 10);
+                const report = formatReport(result);
+                assert.match(report, /Current physical telemetry is unavailable \(0 SigSense observations\)/);
+                assert.match(report, /Historical experience remains context only/);
+                assert.doesNotMatch(report, /Current CPU rose to 8 W|Input tokens 999/);
+                assert.ok(Math.abs(result.runMetrics.average_power_watts - 0) < 1e-9,
+                    'the AI-only projection does not change deterministic no-observation accounting');
+            } finally {
+                await rm(directory, { recursive: true, force: true });
+            }
+        });
+
+        it('handles AI configuration and provider failures without failing the workload', async () => {
+            const result = await runCli({
+                spawnFn: fakeSpawn({ exitCode: 0 }),
+                aiProvider: { explain: async () => { throw new Error('provider is offline'); } },
+                telemetryFn: async (_start, end, resource) => [{
+                    ...tRow(end, 7, 0.001, 0.0001), resource_id: resource, measurement_source: 'hardware',
+                }],
+            });
+            assert.equal(result.exitCode, 0);
+            assert.equal(result.aiExplanation, null);
+            assert.equal(result.aiError, 'provider is offline');
+            assert.ok(Math.abs(result.runMetrics.average_power_watts - 7) < 1e-9);
+            assert.match(formatReport(result), /AI INTERPRETATION[\s\S]*Unavailable: provider is offline/);
+        });
+
+        it('reports AI token metadata as logical usage separate from hardware measurements', async () => {
+            const usageMetadata = {
+                provider: 'ollama', model: 'llama3.2:3b', input_tokens: 30, output_tokens: 10,
+                total_tokens: 40, inference_latency_ms: 150, local_request_latency_ms: 175, request_id: null,
+            };
+            const aiProvider = {
+                name: 'ollama', model: 'llama3.2:3b', usageMetadata: null,
+                async explain() { this.usageMetadata = usageMetadata; return 'Interprets supplied run facts.'; },
+            };
+            const result = await runCli({
+                spawnFn: fakeSpawn({ exitCode: 0 }), aiProvider,
+                telemetryFn: async (_start, end, resource) => [{
+                    ...tRow(end, 7, 0.001, 0.0001), resource_id: resource, measurement_source: 'hardware',
+                }],
+            });
+            assert.deepEqual({
+                signal_type: result.aiUsage.signal_type,
+                provider: result.aiUsage.provider,
+                model: result.aiUsage.model,
+                input_tokens: result.aiUsage.input_tokens,
+                output_tokens: result.aiUsage.output_tokens,
+                total_tokens: result.aiUsage.total_tokens,
+                workload_id: result.aiUsage.workload_id,
+                run_id: result.aiUsage.run_id,
+                attempt_id: result.aiUsage.attempt_id,
+                attempt_no: result.aiUsage.attempt_no,
+                physical_correlation: result.aiUsage.physical_correlation,
+            }, {
+                signal_type: 'logical_ai_usage', provider: usageMetadata.provider, model: usageMetadata.model,
+                input_tokens: 30, output_tokens: 10, total_tokens: 40,
+                workload_id: result.workload.workload_id, run_id: result.run.run_id,
+                attempt_id: result.attempt.attempt_id, attempt_no: result.attempt.attempt_no,
+                physical_correlation: 'not-established',
+            });
+            const report = formatReport(result);
+            assert.match(report, /AI USAGE/);
+            assert.match(report, /Provider: ollama/);
+            assert.match(report, /Input tokens: 30/);
+            assert.match(report, /Output tokens: 10/);
+            assert.match(report, /Total tokens: 40/);
+            assert.match(report, /Request ID: unavailable/);
+            assert.match(report, /Physical inference footprint: unavailable/);
+            assert.match(report, /physical energy measurement/);
         });
     });
 

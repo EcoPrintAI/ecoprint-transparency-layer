@@ -238,17 +238,97 @@ export function formatReport(result) {
     if (!result.baselineComparison) {
         lines.push('', '  INSIGHT', '  Run this workload again to enable differential analysis.');
     } else if (result.insights) {
-        lines.push('', '  INSIGHTS', LINE);
+        lines.push('', '  DETERMINISTIC INSIGHTS', LINE);
         for (const label of ['OBSERVED', 'LIKELY CONTRIBUTOR', 'EVIDENCE', 'RECOMMENDATION']) {
             lines.push(`  ${label}`);
             const entries = label === 'EVIDENCE' ? evidenceLines(result)
                 : label === 'OBSERVED' ? observedLines(result)
                     : (result.insights[label] ?? []).map(insightText).filter(Boolean);
-            if (entries.length === 0) lines.push('    - No additional evidence available.');
-            for (const entry of entries) lines.push(`    - ${entry}`);
+            if (entries.length === 0) lines.push('    • No additional evidence available.');
+            for (const entry of entries) lines.push(`    • ${entry}`);
         }
     }
-    if (result.aiExplanation) lines.push('', '  AI EXPLANATION', LINE, `  ${result.aiExplanation}`);
+    if (result.aiExplanation || result.aiError || result.aiGroundingError) {
+        lines.push('', '  AI INTERPRETATION', LINE);
+        if (result.experienceMemoryError) {
+            lines.push(`  Experience memory: unavailable (${result.experienceMemoryError})`);
+        }
+        if (result.aiError) {
+            lines.push(`  Unavailable: ${result.aiError}`);
+        } else if (result.aiGroundingError) {
+            lines.push(`  Withheld: ${result.aiGroundingError}`);
+            if (result.telemetryCount === 0) {
+                lines.push(`  Current run "${result.workload.name}" completed in ${fmtDuration(result.durationMs)}.`,
+                    '  Current physical telemetry is unavailable (0 SigSense observations); current component power, energy, carbon, and water cannot be reported.',
+                    '  Historical experience remains context only and does not supply current-run measurements.');
+            } else {
+                lines.push('  The explanation conflicted with current deterministic evidence. Use the measured values and insights above.');
+            }
+        } else {
+            const memory = result.aiFacts?.experience_memory;
+            if (memory) lines.push(`  Prior cases: ${memory.cases.length} (${memory.status})`);
+            for (const line of cleanAIExplanation(result.aiExplanation)) lines.push(line ? `  ${line}` : '');
+        }
+    }
+    if (result.aiUsage) {
+        const usage = result.aiUsage;
+        lines.push('', '  AI USAGE', LINE);
+        lines.push(`  Provider: ${usage.provider ?? 'unavailable'}`);
+        lines.push(`  Model: ${usage.model ?? 'unavailable'}`);
+        lines.push(`  Input tokens: ${usage.input_tokens ?? 'unavailable'}`);
+        lines.push(`  Output tokens: ${usage.output_tokens ?? 'unavailable'}`);
+        lines.push(`  Total tokens: ${usage.total_tokens ?? 'unavailable'}`);
+        lines.push(`  Inference latency: ${formatMilliseconds(usage.inference_latency_ms)}`);
+        lines.push(`  Request latency: ${formatMilliseconds(usage.local_request_latency_ms)}`);
+        lines.push(`  Request ID: ${usage.request_id ?? 'unavailable'}`);
+        lines.push('  Physical inference footprint: unavailable — no validated SigSense window for this inference.');
+        lines.push('  Token usage is logical AI metadata, not a physical energy measurement.');
+    }
     lines.push('', SEP, '');
     return lines.join('\n');
+}
+
+function formatMilliseconds(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0
+        ? `${value.toFixed(1)} ms` : 'unavailable';
+}
+
+function cleanAIExplanation(text) {
+    const lines = String(text).replace(/\r\n?/g, '\n').split('\n');
+    const rendered = [];
+    for (const original of lines) {
+        const indentation = original.match(/^\s*/)?.[0].length ?? 0;
+        let line = original.trim();
+        if (!line || /^(```|~~~)/.test(line) || /^([-*_])\1\1+$/.test(line)) {
+            rendered.push('');
+            continue;
+        }
+
+        const heading = line.match(/^#{1,6}\s+(.+)$/);
+        if (heading) line = heading[1].trim().toLocaleUpperCase();
+        if (/^>\s?/.test(line)) line = line.replace(/^>\s?/, '');
+        const list = line.match(/^([-*+])\s+(.+)$/) ?? line.match(/^(\d+)[.)]\s+(.+)$/);
+        if (list) {
+            const depth = Math.min(3, Math.floor(indentation / 2));
+            line = `${'  '.repeat(depth)}• ${list[2]}`;
+        }
+
+        line = line
+            .replace(/!?\[([^\]]*)\]\(([^)]+)\)/g, (_match, label, url) => label ? `${label} (${url})` : url)
+            .replace(/\*\*(.*?)\*\*/g, '$1')
+            .replace(/__(.*?)__/g, '$1')
+            .replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, '$1')
+            .replace(/(?<!_)_([^_]+)_(?!_)/g, '$1')
+            .replace(/`([^`]*)`/g, '$1')
+            .replace(/\\([\\`*_{}\[\]()#+\-.!>])/g, '$1')
+            .trim();
+
+        if (/^#{1,6}\s*$/.test(line)) continue;
+        rendered.push(line);
+    }
+
+    while (rendered[0] === '') rendered.shift();
+    while (rendered.at(-1) === '') rendered.pop();
+    const compact = rendered.filter((line, index) => line !== '' || (index > 0 && rendered[index - 1] !== ''));
+    return compact;
 }

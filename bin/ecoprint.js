@@ -8,6 +8,7 @@
 
 import { runUnderTransparency } from '../src/transparency/cli.js';
 import { formatReport } from '../src/transparency/report.js';
+import { createAIProvider } from '../src/transparency/ai.js';
 
 // ── Argument parsing ──────────────────────────────────────────────────────────
 
@@ -79,6 +80,7 @@ async function main() {
             workloadType: args.type,
             command: args.command,
             identityEnv: process.env,
+            aiProvider: process.env.ECOPRINT_AI === '1' ? createAIProvider() : null,
         });
     } catch (err) {
         console.error(`[EcoPrint] Fatal error: ${err.message}`);

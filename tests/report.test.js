@@ -139,7 +139,7 @@ describe('human-readable report formatting', () => {
             RECOMMENDATION: ['Inspect workload activity during the run and compare it with the baseline power profile.'],
         };
         const report = formatReport(fixture({ baselineComparison: { metrics: deltas() }, insights, telemetryCount: 5 }));
-        for (const header of ['OBSERVED', 'LIKELY CONTRIBUTOR', 'EVIDENCE', 'RECOMMENDATION']) assert.ok(report.includes(header));
+        for (const header of ['DETERMINISTIC INSIGHTS', 'OBSERVED', 'LIKELY CONTRIBUTOR', 'EVIDENCE', 'RECOMMENDATION']) assert.ok(report.includes(header));
         assert.match(report, /5 hardware telemetry observations/);
         assert.match(report, /Component observations: CPU 1, GPU 1, ANE 1/);
         assert.match(report, /100% deterministic attribution/);
@@ -147,6 +147,31 @@ describe('human-readable report formatting', () => {
         assert.match(report, /Energy: \+0\.00368 Wh \(\+3100%\)/);
         assert.match(report, /not proof of causality/);
         assert.doesNotMatch(report, /\{"kind"|baseline_delta|"metric"/);
+    });
+
+    it('renders AI Markdown as clean plain text without changing its wording', () => {
+        const result = fixture({
+            baselineComparison: { metrics: deltas() },
+            insights: { OBSERVED: [], 'LIKELY CONTRIBUTOR': [], EVIDENCE: [], RECOMMENDATION: [] },
+        });
+        result.aiFacts = { experience_memory: { cases: [{}], status: 'retrieved' } };
+        result.aiExplanation = [
+            '## Interpretation',
+            '',
+            '**CPU activity** increased relative to baseline.',
+            '',
+            '### Next steps',
+            '- Run the same workload again.',
+            '- Investigate `CPU` behavior and [the build log](https://example.test/log).',
+            '',
+            '',
+            '> Historical experience remains context only.',
+        ].join('\n');
+
+        const report = formatReport(result);
+        assert.match(report, /DETERMINISTIC INSIGHTS[\s\S]*AI INTERPRETATION/);
+        assert.match(report, /AI INTERPRETATION[\s\S]*Prior cases: 1 \(retrieved\)\n  INTERPRETATION\n\n  CPU activity increased relative to baseline\.\n\n  NEXT STEPS\n  • Run the same workload again\.\n  • Investigate CPU behavior and the build log \(https:\/\/example\.test\/log\)\.\n\n  Historical experience remains context only\./);
+        assert.doesNotMatch(report, /#{1,6}\s|\*\*|(?<!\*)\*(?!\*)|`|\n\s*\n\s*\n/);
     });
 
     it('shows measurement and grid source in short labels', () => {

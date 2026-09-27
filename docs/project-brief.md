@@ -52,7 +52,7 @@ It must remain separate from proprietary EcoPrint AI production systems.
 The prototype must not import, copy, recreate, or modify proprietary
 implementation details from SigSense, Connect, or other proprietary
 EcoPrint components unless explicitly approved.
-
+`
 ## Expected Outcome
 
 The finished prototype should demonstrate a working end-to-end workflow

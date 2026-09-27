@@ -36,7 +36,8 @@ import {
 import { dbRun, dbGet }                       from './db.js';
 import { findBaseline, compareRunMetrics, saveRunMetrics } from './baseline.js';
 import { deriveInsights } from './insights.js';
-import { explainWithProvider } from './ai.js';
+import { buildAIContext, explainWithProvider, normalizeAIUsage, validateAIExplanation } from './ai.js';
+import { experienceContext, retrieveRelevantExperiences, saveExperienceCase } from './experience.js';
 import { prepareTelemetryRows } from './metrics.js';
 import { buildIdentityEnv, readIdentityEnv } from './env.js';
 import { createProcessProvenanceMonitor } from './process_provenance.js';
@@ -361,6 +362,8 @@ export async function runUnderTransparency(opts) {
         attempt,
     });
     const aiFacts = {
+        execution: { started_at: startedAt, ended_at: endedAt, duration_ms: durationMs },
+        telemetry_observation_count: telemetryRows.length,
         identity: {
             workload: { workload_id: workload.workload_id, name: workload.name, identity_source: workload.identity_source },
             run: { run_id: run.run_id, identity_source: run.identity_source },
@@ -397,10 +400,75 @@ export async function runUnderTransparency(opts) {
         },
         baseline: baselineComparison,
         system_context: { other_process_details: 'not collected; process arguments and unrelated process identities are not persisted' },
+        measured_observations: telemetryRows.map(row => ({
+            timestamp: row.timestamp,
+            interval_seconds: row.interval_seconds,
+            total_power_watts: row.total_power_watts,
+            cpu_power_watts: row.cpu_power_watts,
+            gpu_power_watts: row.gpu_power_watts,
+            ane_power_watts: row.ane_power_watts,
+            measurement_source: row.measurement_source,
+        })),
+        deterministic_derived_facts: {
+            metrics: runMetrics,
+            environmental_impact: telemetryRows.map(row => ({
+                timestamp: row.timestamp,
+                carbon_gco2e: row.carbon_gCO2e,
+                water_liters: row.water_liters,
+                grid_intensity_source: row.grid_intensity_source,
+            })),
+        },
     };
-    const aiExplanation = aiProvider
-        ? await explainWithProvider({ facts: aiFacts, insights, provider: aiProvider })
-        : null;
+    let experienceMemoryError = null;
+    if (aiProvider) {
+        try {
+            const cases = await retrieveRelevantExperiences(db, { workload, facts: aiFacts });
+            aiFacts.experience_memory = experienceContext(cases);
+        } catch (err) {
+            experienceMemoryError = err.message;
+            aiFacts.experience_memory = experienceContext([], 'unavailable');
+        }
+    }
+
+    let aiExplanation = null;
+    let aiError = null;
+    let aiGroundingError = null;
+    let aiUsage = null;
+    if (aiProvider) {
+        const aiContext = buildAIContext({ facts: aiFacts, insights });
+        try {
+            const candidate = await explainWithProvider({
+                facts: aiContext.facts, insights: aiContext.insights, provider: aiProvider,
+            });
+            const validation = validateAIExplanation({
+                explanation: candidate, facts: aiContext.facts, providerUsage: aiProvider.usageMetadata,
+            });
+            if (validation.valid) aiExplanation = candidate;
+            else aiGroundingError = validation.reason;
+        } catch (err) {
+            aiError = err.message || 'AI provider request failed';
+        } finally {
+            aiUsage = normalizeAIUsage(aiProvider.usageMetadata, {
+                identity: {
+                    workload_id: workload.workload_id,
+                    run_id: run.run_id,
+                    attempt_id: attempt.attempt_id,
+                    attempt_no: attempt.attempt_no,
+                },
+            });
+            if (aiUsage) aiFacts.logical_ai_usage = aiUsage;
+        }
+    }
+
+    try {
+        await saveExperienceCase(db, {
+            workload, run: completedRun, telemetryRows, runMetrics, reconciliation,
+            processLineage: aiFacts.process_lineage, baselineComparison, insights,
+            aiExplanation, aiProvider, aiUsage,
+        });
+    } catch (err) {
+        experienceMemoryError ??= err.message || 'could not store experience case';
+    }
 
     // ── 10. Close Transparency DB ─────────────────────────────────────────────
     await new Promise((resolve) => db.close(() => resolve()));
@@ -437,6 +505,10 @@ export async function runUnderTransparency(opts) {
         baselineComparison,
         insights,
         aiExplanation,
+        aiUsage,
+        aiError,
+        aiGroundingError,
+        experienceMemoryError,
     };
 }
 

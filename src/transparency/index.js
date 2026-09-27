@@ -98,10 +98,33 @@ export {
 // CLI lifecycle orchestrator
 export { runUnderTransparency, DEFAULT_TRANSPARENCY_DB } from './cli.js';
 
+// Case-based experience memory
+export {
+    saveExperienceCase,
+    getExperienceCase,
+    recordExperienceOutcome,
+    retrieveRelevantExperiences,
+    experienceContext,
+} from './experience.js';
+
 // Derived metric and reasoning interfaces
 export { prepareTelemetryRows, summarizeTelemetry } from './metrics.js';
 export { deriveInsights } from './insights.js';
-export { explainWithProvider } from './ai.js';
+export {
+    AI_GUARDRAILS,
+    DEFAULT_OPENAI_MODEL,
+    DEFAULT_OLLAMA_BASE_URL,
+    DEFAULT_OLLAMA_MODEL,
+    OPENAI_RESPONSES_URL,
+    buildOpenAIRequest,
+    buildOllamaRequest,
+    createAIProvider,
+    createOpenAIProvider,
+    createOllamaProvider,
+    normalizeAIUsage,
+    deriveAIUsageMetrics,
+    explainWithProvider,
+} from './ai.js';
 
 // Identity propagation
 export {
