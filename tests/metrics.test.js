@@ -37,6 +37,27 @@ describe('time-aware telemetry metrics', () => {
         assert.ok(Math.abs(summarizeTelemetry(rows).energy_wh - 20 / 3600) < 1e-12);
     });
 
+    it('uses only the measured overlap of a first hardware sample with a short run', () => {
+        const row = {
+            timestamp: '2099-01-01T00:00:00.500Z',
+            interval_seconds: 0.5,
+            total_power_watts: 10,
+            carbon_gCO2e: 0.05,
+            water_liters: 0.001,
+        };
+        const overlap = prepareTelemetryRows([row],
+            '2099-01-01T00:00:00.200Z', '2099-01-01T00:00:00.400Z');
+        assert.equal(overlap.length, 1);
+        assert.ok(Math.abs(overlap[0].interval_seconds - 0.2) < 1e-12);
+        assert.ok(Math.abs(overlap[0].carbon_gCO2e - 0.02) < 1e-12);
+        assert.ok(Math.abs(overlap[0].water_liters - 0.0004) < 1e-12);
+        assert.ok(Math.abs(summarizeTelemetry(overlap).energy_wh - 2 / 3600) < 1e-12);
+
+        const noOverlap = prepareTelemetryRows([row],
+            '2099-01-01T00:00:00.600Z', '2099-01-01T00:00:00.800Z');
+        assert.deepEqual(noOverlap, [], 'a sample entirely outside the run is not evidence for this run');
+    });
+
     it('does not invent one-second intervals when duration is unavailable', () => {
         assert.deepEqual(summarizeTelemetry([
             { total_power_watts: 12, carbon_gCO2e: 1, water_liters: 2 },

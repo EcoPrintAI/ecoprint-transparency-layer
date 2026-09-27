@@ -175,6 +175,43 @@ describe('EcoPrint Transparency CLI', () => {
         assert.equal(result.runMetrics.provenance_quality, 'estimated-total-with-allocated-split');
     });
 
+    it('keeps a zero-duration point sample unavailable for integrated run metrics', async () => {
+        const result = await runCli({
+            telemetryFn: async (_start, end, resource) => [{
+                timestamp: end, resource_id: resource, total_power_watts: 8,
+                cpu_power_watts: 7, gpu_power_watts: 1, ane_power_watts: 0,
+                carbon_gCO2e: 0.01, water_liters: 0.001, interval_seconds: 0,
+                measurement_source: 'hardware', grid_intensity_source: 'electricity-maps-live',
+            }],
+        });
+        assert.equal(result.telemetryCount, 0);
+        assert.equal(result.runMetrics.measurement_method, 'unavailable');
+        assert.equal(result.runMetrics.energy_wh, 0);
+        assert.equal(result.runMetrics.peak_power_watts, null);
+    });
+
+    it('does not adopt ambient identity unless the CLI entry point supplies it', async () => {
+        const directory = await mkdtemp(path.join(tmpdir(), 'ecoprint-ambient-identity-'));
+        const dbPath = path.join(directory, 'transparency.db');
+        const names = ['ECOPRINT_WORKLOAD_ID', 'ECOPRINT_RUN_ID', 'ECOPRINT_ATTEMPT_ID'];
+        const previous = Object.fromEntries(names.map(name => [name, process.env[name]]));
+        process.env.ECOPRINT_WORKLOAD_ID = 'outer-workload';
+        process.env.ECOPRINT_RUN_ID = 'outer-run';
+        process.env.ECOPRINT_ATTEMPT_ID = 'outer-attempt';
+        try {
+            const result = await runCli({ transparencyDb: dbPath });
+            assert.notEqual(result.workload.workload_id, 'outer-workload');
+            assert.notEqual(result.run.run_id, 'outer-run');
+            assert.notEqual(result.attempt.attempt_id, 'outer-attempt');
+        } finally {
+            for (const name of names) {
+                if (previous[name] === undefined) delete process.env[name];
+                else process.env[name] = previous[name];
+            }
+            await rm(directory, { recursive: true, force: true });
+        }
+    });
+
     it('compares the actual baseline measurement sources in deterministic insights', async () => {
         const directory = await mkdtemp(path.join(tmpdir(), 'ecoprint-cli-baseline-'));
         try {
@@ -526,6 +563,55 @@ describe('EcoPrint Transparency CLI', () => {
             } });
             assert.deepEqual(commands, [`BEGIN ${result.run.run_id}`, `END ${result.run.run_id}`]);
             assert.equal(result.ipcError, null);
+        });
+
+        it('waits for the END flush before reading an overlapping sample for a sub-second run', async () => {
+            let releaseEnd;
+            let signalEndStarted;
+            let telemetryRead = false;
+            const endGate = new Promise(resolve => { releaseEnd = resolve; });
+            const endStarted = new Promise(resolve => { signalEndStarted = resolve; });
+            const execution = runCli({
+                spawnFn: fakeSpawn({ delayMs: 60 }),
+                ipcFn: async command => {
+                    if (command.startsWith('END ')) {
+                        signalEndStarted();
+                        await endGate;
+                    }
+                    return 'OK IDLE';
+                },
+                telemetryFn: async (_start, end, resource) => {
+                    telemetryRead = true;
+                    return [{
+                        timestamp: new Date(Date.parse(end) + 100).toISOString(),
+                        resource_id: resource,
+                        total_power_watts: 10,
+                        cpu_power_watts: 8,
+                        gpu_power_watts: 2,
+                        ane_power_watts: 0,
+                        client_workload_power_watts: 9,
+                        ecoprint_overhead_power_watts: 1,
+                        carbon_gCO2e: 0.05,
+                        water_liters: 0.001,
+                        interval_seconds: 0.5,
+                        measurement_source: 'hardware',
+                        grid_intensity_source: 'electricity-maps-live',
+                    }];
+                },
+            });
+
+            await endStarted;
+            assert.equal(telemetryRead, false, 'query must wait while END drains the sample');
+            releaseEnd();
+            const result = await execution;
+
+            assert.equal(telemetryRead, true);
+            assert.equal(result.telemetryCount, 1);
+            assert.ok(result.runMetrics.duration_ms < 500);
+            assert.ok(result.telemetryRows[0].interval_seconds > 0);
+            assert.ok(result.telemetryRows[0].interval_seconds <= result.runMetrics.duration_ms / 1000);
+            assert.ok(result.runMetrics.energy_wh > 0, 'only the measured overlap contributes energy');
+            assert.equal(result.runMetrics.measurement_method, 'hardware');
         });
     });
 

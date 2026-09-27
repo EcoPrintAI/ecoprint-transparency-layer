@@ -29,7 +29,7 @@ bool validRunId(const std::string& id) {
 }
 
 IPCListener::IPCListener(const std::string& path, std::atomic<bool>& keepRunningRef,
-                         std::function<void(bool)> telemetryStateChangedCallback)
+                         std::function<void(bool, bool)> telemetryStateChangedCallback)
     : socketPath(path), keepRunning(keepRunningRef), listening(false),
       telemetryStateChanged(std::move(telemetryStateChangedCallback)), serverFd(-1)
 #ifdef _WIN32
@@ -135,16 +135,13 @@ void IPCListener::listenLoop() {
             const std::string runId = command.substr(begin ? 6 : 4);
             if (validRunId(runId)) {
                 bool active;
-                bool changed;
                 {
                     std::lock_guard<std::mutex> lock(runsMutex);
-                    const bool previouslyActive = !activeRuns.empty();
                     if (begin) activeRuns.insert(runId);
                     else activeRuns.erase(runId);
                     active = !activeRuns.empty();
-                    changed = previouslyActive != active;
                 }
-                if (changed && telemetryStateChanged) telemetryStateChanged(active);
+                if (telemetryStateChanged) telemetryStateChanged(active, !begin);
                 else telemetryActive = active;
                 response = std::string("OK ") + (active ? "COLLECTING" : "IDLE") + "\n";
             } else {
@@ -195,15 +192,12 @@ void IPCListener::listenLoop() {
                     while (!id.empty() && (id.back() == '\n' || id.back() == '\r')) id.pop_back();
                     if (validRunId(id)) {
                         bool active;
-                        bool changed;
                         {
                             std::lock_guard<std::mutex> lock(runsMutex);
-                            const bool previouslyActive = !activeRuns.empty();
                             if (begin) activeRuns.insert(id); else activeRuns.erase(id);
                             active = !activeRuns.empty();
-                            changed = previouslyActive != active;
                         }
-                        if (changed && telemetryStateChanged) telemetryStateChanged(active);
+                        if (telemetryStateChanged) telemetryStateChanged(active, !begin);
                         else telemetryActive = active;
                         response = std::string("OK ") + (active ? "COLLECTING" : "IDLE") + "\n";
                     } else response = "ERR invalid-run-id\n";

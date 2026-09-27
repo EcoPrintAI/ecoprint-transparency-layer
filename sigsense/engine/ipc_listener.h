@@ -11,7 +11,7 @@
 class IPCListener {
 public:
     IPCListener(const std::string& path, std::atomic<bool>& keepRunningRef,
-                std::function<void(bool)> telemetryStateChanged = {});
+                std::function<void(bool, bool)> telemetryStateChanged = {});
     ~IPCListener();
 
     void start();
@@ -23,7 +23,8 @@ private:
     std::string socketPath;
     std::atomic<bool>& keepRunning;
     std::atomic<bool> listening;
-    std::function<void(bool)> telemetryStateChanged;
+    // Arguments are (whether any run remains active, whether this was END).
+    std::function<void(bool, bool)> telemetryStateChanged;
 #ifndef _WIN32
     int serverFd;
 #else

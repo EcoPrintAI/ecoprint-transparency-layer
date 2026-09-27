@@ -68,6 +68,8 @@ export const DEFAULT_TRANSPARENCY_DB = process.env.ECOPRINT_TRANSPARENCY_DB ??
  * @param {Function} [opts.spawnFn]       Override spawn (for testing).
  * @param {Function} [opts.telemetryFn]   Override telemetry read fn (for testing).
  *                                        Signature: (windowStart, windowEnd, resourceId) => Promise<row[]>
+ * @param {Record<string, string|undefined>} [opts.identityEnv] Explicit identity source.
+ *                                        Defaults to empty to prevent ambient ID reuse.
  * @returns {Promise<RunResult>}
  */
 export async function runUnderTransparency(opts) {
@@ -81,7 +83,7 @@ export async function runUnderTransparency(opts) {
         telemetryFn    = null,
         ipcFn          = sendIpcCommand,
         aiProvider     = null,
-        identityEnv    = process.env,
+        identityEnv    = {},
         processMonitorFactory = createProcessProvenanceMonitor,
     } = opts;
     const externalIdentity = readIdentityEnv(identityEnv);
@@ -236,6 +238,8 @@ export async function runUnderTransparency(opts) {
     let telemetryError = null;
 
     try {
+        // END is a service-side barrier: it drains and persists the final
+        // in-flight sample before the read-only telemetry window is queried.
         if (telemetryFn) {
             // Injected test/override function
             telemetryRows = await telemetryFn(startedAt, endedAt, resourceId);

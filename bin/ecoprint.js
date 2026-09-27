@@ -74,7 +74,12 @@ async function main() {
     process.stdout.write(`\n[EcoPrint] Starting transparency measurement for "${args.name}"...\n`);
     let result;
     try {
-        result = await runUnderTransparency({ workloadName: args.name, workloadType: args.type, command: args.command });
+        result = await runUnderTransparency({
+            workloadName: args.name,
+            workloadType: args.type,
+            command: args.command,
+            identityEnv: process.env,
+        });
     } catch (err) {
         console.error(`[EcoPrint] Fatal error: ${err.message}`);
         process.exit(2);

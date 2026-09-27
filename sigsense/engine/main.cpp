@@ -1,5 +1,6 @@
 #include <iostream>
 #include <chrono>
+#include <condition_variable>
 #include <thread>
 #include <csignal>
 #include <atomic>
@@ -16,6 +17,11 @@
 std::atomic<bool> keepRunning(true);
 std::atomic<bool> telemetryActive(false);
 std::mutex telemetryStateMutex;
+#ifdef __APPLE__
+std::condition_variable telemetrySampleCondition;
+bool telemetrySampleInFlight = false;
+bool telemetryStopRequested = false;
+#endif
 
 namespace {
 std::string databasePath = "ecoprint_telemetry.db";
@@ -46,10 +52,27 @@ int runEngine(const std::string& socketPath) {
     std::cout << "==================================================" << std::endl;
 
     EcoPrintTracker tracker(databasePath, 1, 1.92, configPath);
-    IPCListener ipc(socketPath, keepRunning, [&tracker](bool active) {
-        std::lock_guard<std::mutex> lock(telemetryStateMutex);
+    IPCListener ipc(socketPath, keepRunning, [&tracker](bool active, bool endMarker) {
+        std::unique_lock<std::mutex> lock(telemetryStateMutex);
+#ifdef __APPLE__
+        if (endMarker) {
+            telemetryStopRequested = true;
+            telemetrySampleCondition.notify_all();
+            telemetrySampleCondition.wait(lock, [] { return !telemetrySampleInFlight; });
+            telemetryActive = active;
+            tracker.forceFlush();
+            telemetryStopRequested = false;
+            telemetrySampleCondition.notify_all();
+            return;
+        }
+#endif
         telemetryActive = active;
-        if (!active) tracker.forceFlush();
+#ifndef __APPLE__
+        if (endMarker) tracker.forceFlush();
+#endif
+#ifdef __APPLE__
+        if (active) telemetrySampleCondition.notify_all();
+#endif
     });
     ipc.start();
 
