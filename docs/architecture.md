@@ -53,6 +53,32 @@ EcoPrint's broader measurement, attribution, and accounting systems.
 Full attribution, enterprise accounting, dashboards, and proprietary
 EcoPrint systems are outside the MVP scope.
 
+## Workload Provenance and Self-Measurement Boundary
+
+The total power, energy, carbon, and water series remain the observed system
+totals. The existing client-workload and EcoPrint-overhead power series are
+carried through as allocations; they are not presented as directly measured
+per-process watts. Carbon and water splits are proportional allocations from
+the observed totals and are shown only when the power split reconciles to total
+power.
+
+On macOS, the CLI records its own process context, the launched workload
+process, and discovered descendants from periodic process snapshots. It stores
+PID/parent PID, executable name, approximate process start time, observed
+window, and provenance class in the existing derived context table. It does
+not store argv or environment variables. Process existence and lineage are
+provenance evidence, not proof of watt ownership; discovered process contexts
+do not divide system-wide telemetry unless a future telemetry source supplies
+a matching process identity.
+
+The hardware measurement covers the system while the measurement service and
+CLI are active, so their work is part of the observed total. The current model
+does not isolate sampler energy directly. The client/observer split therefore
+retains the source's allocation method and must be treated as allocated or
+unavailable, never as independently measured process energy. Background
+process identity and kernel-level work remain outside the current capture
+boundary.
+
 ## Constraints
 
 - Standalone hackathon project
